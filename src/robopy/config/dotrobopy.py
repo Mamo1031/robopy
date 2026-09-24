@@ -1,24 +1,46 @@
+"""User overrides for Rakuda from ``.robopy/rakuda/config.yaml`` (spec §7.3).
+
+Every value that is ``null`` (or absent) leaves the ``RakudaConfig`` built in
+code untouched, so the generated default file changes nothing. Priority is
+CLI/code > YAML > dataclass defaults.
+"""
+
 from __future__ import annotations
 
-from dataclasses import replace
+import logging
+from dataclasses import fields, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Collection, Mapping
 
 import yaml
 
 if TYPE_CHECKING:
-    from robopy.config.robot_config.rakuda_config import RakudaConfig
+    from robopy.config.robot_config.rakuda_config import RakudaBilateralParams, RakudaConfig
 
+logger = logging.getLogger(__name__)
 
 _UNSET: Any = object()
 
+_TOP_LEVEL_KEYS: frozenset[str] = frozenset({"leader", "follower", "safety", "bilateral"})
+_SIDE_KEYS: frozenset[str] = frozenset({"port", "torque_enabled"})
+_SAFETY_KEYS: frozenset[str] = frozenset({"hold_on_disconnect"})
+_NESTED_BILATERAL_KEYS: tuple[str, ...] = ("leader_health", "follower_health")
 
-def _as_dict(value: Any) -> dict[str, Any]:
+
+def _as_dict(value: Any, *, name: str = "YAML") -> dict[str, Any]:
     if value is None:
         return {}
     if not isinstance(value, dict):
-        raise ValueError(f"Expected a mapping in YAML, got {type(value).__name__}.")
+        raise ValueError(f"Expected a mapping in {name}, got {type(value).__name__}.")
     return value
+
+
+def _reject_unknown_keys(
+    section: Mapping[str, Any], *, allowed: Collection[str], section_name: str
+) -> None:
+    unknown = sorted(str(key) for key in section if key not in allowed)
+    if unknown:
+        raise ValueError(f"Unknown key(s) in {section_name}: {unknown}. Allowed: {sorted(allowed)}")
 
 
 def _as_str_list_or_none(value: Any, *, field_name: str) -> list[str] | None:
@@ -66,6 +88,77 @@ def _parse_torque_enabled_yaml(
     raise ValueError(f"{field_name} must be a list[str], a keyword, or null.")
 
 
+def _parse_port_yaml(value: Any, *, field_name: str) -> str | None:
+    """Parse YAML port into a device path, ``PORT_AUTO`` or None (null)."""
+
+    from robopy.config.robot_config.rakuda_config import PORT_AUTO
+
+    if value is None:
+        return None
+    if isinstance(value, str) and value.strip():
+        port = value.strip()
+        return PORT_AUTO if port.lower() == PORT_AUTO else port
+    raise ValueError(f"{field_name} must be a device path, '{PORT_AUTO}', or null.")
+
+
+def _parse_bool_yaml(value: Any, *, field_name: str) -> bool | None:
+    if value is None or isinstance(value, bool):
+        return value
+    raise ValueError(f"{field_name} must be true, false, or null.")
+
+
+def _non_null_overrides(
+    section: Mapping[str, Any], *, allowed: Collection[str], section_name: str
+) -> dict[str, Any]:
+    _reject_unknown_keys(section, allowed=allowed, section_name=section_name)
+    return {key: value for key, value in section.items() if value is not None}
+
+
+def _parse_bilateral_yaml(section: Mapping[str, Any]) -> dict[str, Any]:
+    """Collect the non-null ``bilateral:`` overrides, validating keys (not values).
+
+    Nested ``leader_health`` / ``follower_health`` mappings come back as dicts
+    of their own non-null keys; a ``gravity_scale`` mapping drops null entries.
+    Values are validated by ``RakudaBilateralParams.__post_init__`` when applied.
+    """
+
+    from robopy.config.robot_config.rakuda_config import (
+        BusHealthThresholds,
+        RakudaBilateralParams,
+    )
+
+    overrides = _non_null_overrides(
+        section,
+        allowed=[f.name for f in fields(RakudaBilateralParams)],
+        section_name="bilateral",
+    )
+    health_keys = [f.name for f in fields(BusHealthThresholds)]
+    for key in _NESTED_BILATERAL_KEYS:
+        if key in overrides:
+            overrides[key] = _non_null_overrides(
+                _as_dict(overrides[key], name=f"bilateral.{key}"),
+                allowed=health_keys,
+                section_name=f"bilateral.{key}",
+            )
+    if isinstance(overrides.get("gravity_scale"), dict):
+        overrides["gravity_scale"] = {
+            joint: value for joint, value in overrides["gravity_scale"].items() if value is not None
+        }
+    return overrides
+
+
+def _apply_bilateral_overrides(
+    base: RakudaBilateralParams, overrides: Mapping[str, Any]
+) -> RakudaBilateralParams:
+    """``dataclasses.replace(base, **overrides)`` with the nested thresholds merged."""
+
+    kwargs = dict(overrides)
+    for key in _NESTED_BILATERAL_KEYS:
+        if key in kwargs:
+            kwargs[key] = replace(getattr(base, key), **kwargs[key])
+    return replace(base, **kwargs)
+
+
 def get_dotrobopy_dir(base_dir: Path | None = None) -> Path:
     """Return the base `.robopy` directory.
 
@@ -110,6 +203,43 @@ def ensure_rakuda_yaml_exists(base_dir: Path | None = None) -> Path:
     return yaml_path
 
 
+def _yaml_scalar(value: Any) -> str:
+    return yaml.safe_dump(value, default_flow_style=True).strip().removesuffix("\n...")
+
+
+def _bilateral_template_lines() -> list[str]:
+    """The commented-out ``bilateral:`` example block, built from the dataclass defaults."""
+
+    from robopy.config.robot_config.rakuda_config import RakudaBilateralParams
+
+    defaults = RakudaBilateralParams()
+    example_keys = (
+        "control_hz",
+        "follower_divider",
+        "read_timeout_s",
+        "follower_read_timeout_s",
+        "gravity_scale",
+        "feedback_kp_ma_per_count",
+        "feedback_kd_ma_per_vcount",
+        "limit_kp_ma_per_count",
+        "limit_kd_ma_per_vcount",
+        "current_max_ma",
+    )
+    lines = ["# bilateral:"]
+    for key in example_keys:
+        lines.append(f"#   {key}: {_yaml_scalar(getattr(defaults, key))}")
+    lines.append("#   # gravity_scale: {r_arm_sh_pitch1: 0.95, l_arm_sh_pitch1: 0.95}")
+    health = defaults.leader_health
+    lines.append(
+        "#   leader_health: {"
+        f"warn_temperature_c: {_yaml_scalar(health.warn_temperature_c)}, "
+        f"max_temperature_c: {_yaml_scalar(health.max_temperature_c)}, "
+        f"max_voltage_v: {_yaml_scalar(health.max_voltage_v)}"
+        "}"
+    )
+    return lines
+
+
 def ensure_default_rakuda_yaml(path: Path, *, joint_names: tuple[str, ...]) -> None:
     """Create a default Rakuda YAML if it does not exist.
 
@@ -127,24 +257,41 @@ def ensure_default_rakuda_yaml(path: Path, *, joint_names: tuple[str, ...]) -> N
             "# robopy user config (Rakuda)",
             "#",
             "# This file is created automatically. Edit it to customize Rakuda behavior.",
+            "# A null (or commented-out) value keeps whatever the code passed in.",
             "#",
             "# Semantics:",
+            "# - leader.port / follower.port: serial device path, or 'auto' to detect the bus",
+            "#   by scanning (null -> the port given in code)",
             "# - leader.torque_enabled: joints to torque ON (null -> default: grippers only)",
             "# - follower.torque_enabled: joints to torque ON (null -> default: all joints)",
+            "# - safety.hold_on_disconnect: keep both arms torque-on in place on disconnect",
+            "#   (null -> true in bilateral mode, false in conventional mode)",
+            "# - bilateral: gain / timing overrides for the leader current-control loop.",
+            "#   Ignored (INFO) unless RakudaConfig(bilateral=RakudaBilateralParams(...)) is",
+            "#   passed in code; there is no 'enabled' key. When bilateral is active,",
+            "#   follower.torque_enabled must include every bilateral.current_joints entry,",
+            "#   and those joints are dropped from leader.torque_enabled (the loop owns them).",
             "#",
             "# Available joint names:",
             joint_list_comment,
             "",
             "leader:",
             "  torque_enabled: null",
+            "  # port: auto",
             "  # torque_enabled:",
             "  #   - l_arm_grip",
             "  #   - r_arm_grip",
             "",
             "follower:",
             "  torque_enabled: null",
+            "  # port: /dev/ttyUSB0",
             "  # torque_enabled:",
             "  #   - torso_yaw",
+            "",
+            "# safety:",
+            "#   hold_on_disconnect: null",
+            "",
+            *_bilateral_template_lines(),
             "",
         ]
     )
@@ -187,7 +334,11 @@ def apply_rakuda_dotconfig(
 ) -> "RakudaConfig":
     """Apply `.robopy/rakuda/config.yaml` overrides to a RakudaConfig.
 
-    This also ensures the directory and default YAML exist.
+    This also ensures the directory and default YAML exist. Only non-null YAML
+    values override ``cfg``; the ``bilateral:`` section is applied with
+    ``dataclasses.replace`` onto ``cfg.bilateral`` and ignored (INFO) when
+    ``cfg.bilateral`` is None. Unknown keys inside the known sections raise
+    ``ValueError``.
     """
 
     # Local import to avoid circular dependency in robopy.config package.
@@ -200,8 +351,17 @@ def apply_rakuda_dotconfig(
 
     data = load_yaml(yaml_path)
 
-    leader = _as_dict(data.get("leader"))
-    follower = _as_dict(data.get("follower"))
+    unknown_sections = sorted(str(key) for key in data if key not in _TOP_LEVEL_KEYS)
+    if unknown_sections:
+        logger.warning("Ignoring unknown top-level key(s) in %s: %s", yaml_path, unknown_sections)
+
+    leader = _as_dict(data.get("leader"), name="leader")
+    follower = _as_dict(data.get("follower"), name="follower")
+    safety = _as_dict(data.get("safety"), name="safety")
+    _reject_unknown_keys(leader, allowed=_SIDE_KEYS, section_name="leader")
+    _reject_unknown_keys(follower, allowed=_SIDE_KEYS, section_name="follower")
+    _reject_unknown_keys(safety, allowed=_SAFETY_KEYS, section_name="safety")
+    bilateral_overrides = _parse_bilateral_yaml(_as_dict(data.get("bilateral"), name="bilateral"))
 
     leader_torque_enabled = _parse_torque_enabled_yaml(
         leader.get("torque_enabled"),
@@ -222,10 +382,31 @@ def apply_rakuda_dotconfig(
 
     # Only override if YAML explicitly provides a non-null value.
     updates: dict[str, Any] = {}
+    leader_port = _parse_port_yaml(leader.get("port"), field_name="leader.port")
+    if leader_port is not None:
+        updates["leader_port"] = leader_port
+    follower_port = _parse_port_yaml(follower.get("port"), field_name="follower.port")
+    if follower_port is not None:
+        updates["follower_port"] = follower_port
     if leader_torque_enabled is not None:
         updates["leader_torque_enabled"] = leader_torque_enabled
     if follower_torque_enabled is not None:
         updates["follower_torque_enabled"] = follower_torque_enabled
+    hold_on_disconnect = _parse_bool_yaml(
+        safety.get("hold_on_disconnect"), field_name="safety.hold_on_disconnect"
+    )
+    if hold_on_disconnect is not None:
+        updates["hold_on_disconnect"] = hold_on_disconnect
+    if bilateral_overrides:
+        if cfg.bilateral is None:
+            logger.info(
+                "Ignoring the bilateral: section of %s (%s): RakudaConfig.bilateral is None, "
+                "so the conventional position-teleoperation path is used.",
+                yaml_path,
+                sorted(bilateral_overrides),
+            )
+        else:
+            updates["bilateral"] = _apply_bilateral_overrides(cfg.bilateral, bilateral_overrides)
 
     if not updates:
         return cfg
@@ -261,8 +442,8 @@ def update_rakuda_yaml_torque_enabled(
     if follower is not _UNSET:
         validate_joint_names(follower, allowed=allowed, field_name="follower.torque_enabled")
 
-    leader_dict = _as_dict(data.get("leader"))
-    follower_dict = _as_dict(data.get("follower"))
+    leader_dict = _as_dict(data.get("leader"), name="leader")
+    follower_dict = _as_dict(data.get("follower"), name="follower")
 
     if leader is not _UNSET:
         leader_dict["torque_enabled"] = leader
