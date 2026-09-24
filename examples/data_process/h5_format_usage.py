@@ -9,6 +9,18 @@ import numpy as np
 
 from robopy.utils import H5Handler
 
+# rakuda_observations.h5 スキーマ v2 で追加された arm/ 配下のデータセット（任意）。
+# 旧ファイルには無いので、読む側は必ず `in` で確認する。
+OPTIONAL_ARM_DATASETS = (
+    "leader_velocity",
+    "follower_velocity",
+    "leader_current",
+    "follower_current",
+    "leader_time_s",
+    "follower_time_s",
+    "frame_time_s",
+)
+
 
 def example_hierarchical_save() -> None:
     """階層的なデータ構造をH5形式で保存する例"""
@@ -50,6 +62,12 @@ def example_hierarchical_save() -> None:
     leader_shape = loaded_data["arm"]["leader"].shape
     follower_shape = loaded_data["arm"]["follower"].shape
     print(f"  Arm shapes: {leader_shape}, {follower_shape}")
+
+    # スキーマ v2 の追加データセット（速度・電流・時刻）は存在するときだけ読む
+    arm = loaded_data["arm"]
+    for name in OPTIONAL_ARM_DATASETS:
+        if name in arm:
+            print(f"  arm/{name}: shape={arm[name].shape}")
 
 
 def example_single_array() -> None:
@@ -101,7 +119,11 @@ def example_rakuda_save_worker() -> None:
     print("    │   └── right")
     print("    └── arm/")
     print("        ├── leader")
-    print("        └── follower")
+    print("        ├── follower")
+    print("        ├── leader_velocity, follower_velocity   (schema v2, optional)")
+    print("        ├── leader_current, follower_current     (schema v2, optional)")
+    print("        └── leader_time_s, follower_time_s, frame_time_s (schema v2, optional)")
+    print("  arm@schema_version / joint_names / *_unit / current_sign ... are attributes")
 
 
 # ========================================
