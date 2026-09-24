@@ -10,7 +10,11 @@ import numpy as np
 from numpy.typing import NDArray
 
 T = TypeVar("T")
-HierarchicalTaskData: TypeAlias = Dict[str, dict[str, NDArray[np.float32] | NDArray[np.uint8]]]
+#: One HDF5 group per key: arrays become datasets, ``str``/``int``/``float``
+#: values become the group's attributes (see ``H5Handler._save_dict_to_group``).
+HierarchicalTaskData: TypeAlias = Dict[
+    str, dict[str, NDArray[np.float32] | NDArray[np.uint8] | str | int | float]
+]
 
 logger = getLogger(__name__)
 
