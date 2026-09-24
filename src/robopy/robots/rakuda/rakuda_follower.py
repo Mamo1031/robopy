@@ -1,10 +1,10 @@
 import logging
 
 from robopy.config.robot_config import RAKUDA_CONTROLTABLE_VALUES, RakudaConfig
+from robopy.config.robot_config.rakuda_config import resolve_torque_policy
 from robopy.motor.dynamixel_bus import DynamixelMotor
-from robopy.motor.dynamixel_control_table import XControlTable
 
-from .rakuda_arm import RakudaArm
+from .rakuda_arm import BusFactory, ConnectState, RakudaArm
 
 logger = logging.getLogger(__name__)
 
@@ -12,8 +12,12 @@ logger = logging.getLogger(__name__)
 class RakudaFollower(RakudaArm):
     """Class representing the follower arm of the Rakuda robotic system."""
 
-    def __init__(self, cfg: RakudaConfig):
-        super().__init__(cfg, cfg.follower_port)
+    SIDE = "follower"
+    GRIP_CURRENT_LIMIT = RAKUDA_CONTROLTABLE_VALUES.FOLLOWER_GRIP_CURRENT_LIMIT
+    GRIP_GOAL_CURRENT = RAKUDA_CONTROLTABLE_VALUES.FOLLOWER_GRIP_GOAL_CURRENT
+
+    def __init__(self, cfg: RakudaConfig, bus_factory: BusFactory | None = None):
+        super().__init__(cfg, cfg.follower_port, bus_factory)
 
     def _create_motors(self) -> dict[str, DynamixelMotor]:
         """Create motor configuration for the follower arm using xm430-w350 motors."""
@@ -40,45 +44,11 @@ class RakudaFollower(RakudaArm):
             "l_arm_grip": DynamixelMotor(30, "l_arm_grip", "xm430-w350"),
         }
 
-    def _init_control_mode(self) -> None:
-        """Initialize control mode for follower arm with gripper configuration."""
-        # Set 2 gripper motors to Current-based position control mode: 5
-        # details:https://emanual.robotis.com/docs/en/dxl/x/xm430-w350/#operating-mode
+    def _apply_torque_policy(self, state: ConnectState) -> None:
+        """Follower torque policy (spec D15/D35), the same in both modes.
 
-        super()._init_control_mode()
-        for motor_name in ["l_arm_grip", "r_arm_grip"]:
-            # Set goal current for gripper motors to limit gripping force
-            self.motors.write(
-                XControlTable.CURRENT_LIMIT,
-                motor_name,
-                RAKUDA_CONTROLTABLE_VALUES.FOLLOWER_GRIP_CURRENT_LIMIT,
-            )
-            self.motors.write(
-                XControlTable.GOAL_CURRENT,
-                motor_name,
-                RAKUDA_CONTROLTABLE_VALUES.FOLLOWER_GRIP_GOAL_CURRENT,
-            )
-
-    def connect(self) -> None:
-        """Connect to the follower arm and enable torque."""
-        super().connect()
-        if not self._is_connected:
-            return
-
-        # Always read all joints, but only torque-enable configured joints.
-        self._motors.torque_disabled()
-
-        enabled = self.config.follower_torque_enabled
-        if enabled is None:
-            self._motors.torque_enabled()
-        elif enabled:
-            self._motors.torque_enabled(specific_motor_names=enabled)
-
-    def disconnect(self) -> None:
-        """Disconnect from the follower arm and disable torque."""
-        if self._is_connected:
-            try:
-                self.motors.torque_disabled()
-            except Exception as e:
-                logger.warning(f"Failed to disable torque during disconnect: {e}")
-        super().disconnect()
+        Motors that are on but not wanted are switched off, wanted motors that
+        are off are switched on; a wanted motor that is already on is never
+        touched (the gripper EEPROM step ran before this).
+        """
+        self._switch_torque(state, resolve_torque_policy(self.config).follower)
