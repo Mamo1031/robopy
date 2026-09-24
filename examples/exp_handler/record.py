@@ -32,10 +32,8 @@ def rakuda_exp_send():
     try:
         action = handler.record(max_frames=200).arms.leader
         handler.send(max_frame=200, fps=10, leader_action=action)
-    except Exception as e:
-        raise e
-    except KeyboardInterrupt:
-        handler.robot.disconnect()
+    finally:
+        handler.close()
 
 
 if __name__ == "__main__":
@@ -57,4 +55,7 @@ if __name__ == "__main__":
         ),
         fps=10,
     )
-    handler.record_save(max_frames=100, save_path="test_01")
+    try:
+        handler.record_save(max_frames=100, save_path="test_01")
+    finally:
+        handler.close()
