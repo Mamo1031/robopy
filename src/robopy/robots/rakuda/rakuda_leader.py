@@ -1,10 +1,15 @@
 import logging
 
 from robopy.config.robot_config import RAKUDA_CONTROLTABLE_VALUES, RakudaConfig
+from robopy.config.robot_config.rakuda_config import (
+    LEADER_GRIP_HOLD_POSITION,
+    RAKUDA_GRIPPER_JOINT_NAMES,
+    resolve_torque_policy,
+)
 from robopy.motor.dynamixel_bus import DynamixelMotor
 from robopy.motor.dynamixel_control_table import XControlTable
 
-from .rakuda_arm import RakudaArm
+from .rakuda_arm import BusFactory, ConnectState, RakudaArm
 
 logger = logging.getLogger(__name__)
 
@@ -12,8 +17,12 @@ logger = logging.getLogger(__name__)
 class RakudaLeader(RakudaArm):
     """Class representing the leader arm of the Rakuda robotic system."""
 
-    def __init__(self, cfg: RakudaConfig):
-        super().__init__(cfg, cfg.leader_port)
+    SIDE = "leader"
+    GRIP_CURRENT_LIMIT = RAKUDA_CONTROLTABLE_VALUES.LEADER_GRIP_CURRENT_LIMIT
+    GRIP_GOAL_CURRENT = RAKUDA_CONTROLTABLE_VALUES.LEADER_GRIP_GOAL_CURRENT
+
+    def __init__(self, cfg: RakudaConfig, bus_factory: BusFactory | None = None):
+        super().__init__(cfg, cfg.leader_port, bus_factory)
 
     def _create_motors(self) -> dict[str, DynamixelMotor]:
         """Create motor configuration for the leader arm using xc330-t288 motors."""
@@ -40,45 +49,40 @@ class RakudaLeader(RakudaArm):
             "l_arm_grip": DynamixelMotor(30, "l_arm_grip", "xc330-t288"),
         }
 
-    def _init_control_mode(self) -> None:
-        """Initialize control mode for leader arm (no special initialization needed)."""
-        super()._init_control_mode()
+    def _apply_torque_policy(self, state: ConnectState) -> None:
+        """Leader torque policy (spec D15/D35).
 
-        for motor_name in ["l_arm_grip", "r_arm_grip"]:
-            # Set goal current for gripper motors to limit gripping force
-            self.motors.write(
-                XControlTable.CURRENT_LIMIT,
-                motor_name,
-                RAKUDA_CONTROLTABLE_VALUES.LEADER_GRIP_CURRENT_LIMIT,
+        Conventional mode: a motor that is on but not wanted is a previous
+        session's hold and connecting is refused (``ConnectionError``), so the
+        arm is never dropped silently. Bilateral mode: the current-controlled
+        joints are only logged (the loop owns their ``TORQUE_ENABLE``) and a
+        ``leader_torque_enabled`` entry among them is warned about once.
+        Grippers are always held at ``LEADER_GRIP_HOLD_POSITION``.
+        """
+        policy = resolve_torque_policy(self.config)
+        want = policy.leader
+        bilateral = self.config.bilateral
+        if bilateral is None:
+            held = [n for n in self.motor_names if n in state.torque_on and n not in want]
+            if held:
+                raise self._held_by_previous_session_error(held)
+            current_joints: tuple[str, ...] = ()
+        else:
+            current_joints = bilateral.current_joints
+            logger.info(
+                "leader: bilateral joints left as found (mode/torque): %s",
+                {n: (state.mode[n], state.torque[n]) for n in current_joints},
             )
-            self.motors.write(
-                XControlTable.GOAL_CURRENT,
-                motor_name,
-                RAKUDA_CONTROLTABLE_VALUES.LEADER_GRIP_GOAL_CURRENT,
-            )
-
-    def connect(self) -> None:
-        super().connect()
-        if not self._is_connected:
-            return
-
-        # Always read all joints, but only torque-enable configured joints.
-        self._motors.torque_disabled()
-        enabled = self.config.leader_torque_enabled
-        self._motors.torque_enabled(specific_motor_names=["l_arm_grip", "r_arm_grip"])
+            if policy.dropped_from_leader:
+                logger.warning(
+                    "leader_torque_enabled names the bilateral joints %s; ignored, the current "
+                    "loop owns their TORQUE_ENABLE.",
+                    list(policy.dropped_from_leader),
+                )
+        self._switch_torque(state, want, untouched=current_joints)
 
         # Fix leader initial gripper pose.
-        # NOTE: 2600 is used as the max/open position for the Rakuda leader grippers.
-        for motor_name in ["l_arm_grip", "r_arm_grip"]:
-            self.motors.write(
-                XControlTable.GOAL_POSITION,
-                motor_name,
-                RAKUDA_CONTROLTABLE_VALUES.GRIP_MAX_POSITION,
-            )
-        if enabled:
-            self._motors.torque_enabled(specific_motor_names=enabled)
-
-    def disconnect(self) -> None:
-        if self._is_connected:
-            self._motors.torque_disabled()
-        super().disconnect()
+        self._motors.sync_write(
+            XControlTable.GOAL_POSITION,
+            {name: LEADER_GRIP_HOLD_POSITION for name in RAKUDA_GRIPPER_JOINT_NAMES},
+        )
