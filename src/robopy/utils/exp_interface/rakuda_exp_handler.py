@@ -1,5 +1,8 @@
+import json
 import logging
+import os
 import time
+from dataclasses import replace
 from time import sleep
 from typing import Any, Dict, List
 
@@ -70,7 +73,9 @@ class RakudaExpHandler(ExpHandler[RakudaObs, RakudaRobot, RakudaConfig, RakudaSa
         self._last_follower_action: NDArray[float32] | None = None
 
         self._robot = RakudaRobot(config)
-        self._save_worker = RakudaSaveWorker(config, worker_num=6, fps=self.fps)
+        self._save_worker = RakudaSaveWorker(
+            config, worker_num=6, fps=self.fps, control_report=self._robot.control_report
+        )
 
         try:
             self._robot.connect()
@@ -161,9 +166,15 @@ class RakudaExpHandler(ExpHandler[RakudaObs, RakudaRobot, RakudaConfig, RakudaSa
         return self._robot.config
 
     def _init_config(self, rakuda_config: RakudaConfig) -> RakudaConfig:
-        leader_port_num = rakuda_config.leader_port
-        follower_port_num = rakuda_config.follower_port
-        config: RakudaConfig = rakuda_config
+        """Fills in the default camera without dropping any other field (spec D34).
+
+        ``rakuda_config`` is never mutated: it is returned as is when it already
+        names its cameras, otherwise a ``dataclasses.replace`` copy carrying the
+        default ``main`` camera (and the given tactile/audio lists) is returned.
+        """
+        sensors = rakuda_config.sensors
+        if sensors is not None and sensors.cameras:
+            return rakuda_config
         cameras: List[CameraParams] = [
             CameraParams(
                 name="main",
@@ -172,21 +183,37 @@ class RakudaExpHandler(ExpHandler[RakudaObs, RakudaRobot, RakudaConfig, RakudaSa
                 fps=30,
             )
         ]
-        if config.sensors is None:
-            config = RakudaConfig(
-                leader_port=leader_port_num,
-                follower_port=follower_port_num,
-                sensors=RakudaSensorParams(cameras=cameras, tactile=[], audio=[]),
-            )
+        if sensors is None:
+            sensors = RakudaSensorParams(cameras=cameras, tactile=[], audio=[])
         else:
-            if len(config.sensors.cameras) == 0:
-                config.sensors.cameras = cameras  # default camera
-            if len(config.sensors.tactile) == 0:
-                config.sensors.tactile = []  # default no tactile
-            if len(config.sensors.audio) == 0:
-                config.sensors.audio = []  # default no audio
+            sensors = replace(sensors, cameras=cameras)  # default camera
+        return replace(rakuda_config, sensors=sensors)
 
-        return config
+    def save_metadata(self, save_path: str, data_shape: Dict[str, Any] | None = None) -> None:
+        """Writes ``metadata.json`` with the base fields plus ``control`` (spec §8.4).
+
+        ``control`` is ``RakudaRobot.control_report()``; ``control.config_mismatch``
+        is set when the reported mode disagrees with ``config.bilateral``.
+        """
+        metadata: dict[str, Any] = {}
+        metadata["task_details"] = self.metadata_config.__dict__
+        if data_shape:
+            metadata["data_shape"] = data_shape
+        metadata["robot_config"] = self._serialize_config(self.config)
+        control = self.robot.control_report()
+        expected_mode = "leader_current" if self.config.bilateral is not None else "position_teleop"
+        if control.get("mode") != expected_mode:
+            control["config_mismatch"] = True
+            logger.warning(
+                "control mode %s disagrees with config.bilateral (expected %s); "
+                "config_mismatch set",
+                control.get("mode"),
+                expected_mode,
+            )
+        metadata["control"] = control
+
+        with open(os.path.join(save_path, "metadata.json"), "w") as f:
+            json.dump(metadata, f, indent=2, default=self._json_serializer)
 
     def _extract_data_shapes(self, obs: RakudaObs) -> dict[str, Any]:
         """Extract data shapes from observation for metadata.
