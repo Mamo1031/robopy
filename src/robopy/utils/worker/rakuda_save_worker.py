@@ -1,7 +1,7 @@
 import os
 from concurrent.futures import Future
 from logging import getLogger
-from typing import Dict, cast
+from typing import Any, Callable, Dict, Mapping, Sequence, cast
 
 import matplotlib
 from rich.console import Console
@@ -17,7 +17,11 @@ from matplotlib.image import AxesImage
 from numpy.typing import NDArray
 
 from robopy.config import RakudaConfig
-from robopy.config.robot_config.rakuda_config import RakudaObs
+from robopy.config.robot_config.rakuda_config import (
+    RAKUDA_JOINT_NAMES,
+    RakudaArmObs,
+    RakudaObs,
+)
 from robopy.utils.blosc_handler import BLOSCHandler
 from robopy.utils.h5_handler import H5Handler
 
@@ -27,12 +31,50 @@ logger = getLogger(__name__)
 
 console = Console()
 
+#: Schema of the ``arm`` group of ``rakuda_observations.h5`` (spec §8.3).
+ARM_SCHEMA_VERSION = 2
+_ARM_UNITS: Dict[str, str] = {
+    "position_unit": "count",
+    "velocity_unit": "count_0.229rpm",
+    "current_unit": "mA",
+    "time_unit": "s_since_record_start",
+}
+#: ``control_report()["record"]`` keys copied to ``arm`` attributes, with their type.
+_RECORD_ATTRIBUTES: tuple[tuple[str, type], ...] = (
+    ("t0_monotonic_ns", int),
+    ("t0_unix_s", float),
+    ("terminated_by", str),
+    ("frames_requested", int),
+)
+
+
+def _sign_row(signs: Mapping[str, Any], names: Sequence[str]) -> str:
+    """The 17 current signs as a comma-joined string; ``0`` marks an unmeasured joint."""
+    return ",".join(str(int(signs.get(name, 0))) for name in names)
+
 
 class RakudaSaveWorker(SaveWorker[RakudaObs]):
-    def __init__(self, cfg: RakudaConfig, worker_num: int, fps: int) -> None:
+    def __init__(
+        self,
+        cfg: RakudaConfig,
+        worker_num: int,
+        fps: int,
+        control_report: Callable[[], Dict[str, Any]] | None = None,
+    ) -> None:
+        """Creates the worker.
+
+        Args:
+            cfg: Robot configuration.
+            worker_num: Threads of the save pool.
+            fps: Recording rate, written as ``arm@record_fps``.
+            control_report: ``RakudaRobot.control_report``; called when an
+                observation is saved to fill the ``arm`` attributes of spec §8.3.
+                None writes the schema attributes only.
+        """
         super().__init__(worker_num=worker_num)
         self.cfg = cfg
         self.fps = fps
+        self._control_report = control_report
 
     def _process_task(self, task: SaveTask) -> Future[None] | None:
         match task.task_type:
@@ -115,8 +157,7 @@ class RakudaSaveWorker(SaveWorker[RakudaObs]):
         Dict[str, NDArray[np.float32]],
         Dict[str, NDArray[np.float32]],
         Dict[str, NDArray[np.float32]],
-        NDArray[np.float32],
-        NDArray[np.float32],
+        RakudaArmObs,
     ]:
         """Extract and prepare Rakuda sensor observation data for saving.
 
@@ -125,7 +166,7 @@ class RakudaSaveWorker(SaveWorker[RakudaObs]):
             save_dir (str): Directory to save the data.
 
         Returns:
-            tuple: (camera_data, tactile_data, audio_data, leader, follower)
+            tuple: (camera_data, tactile_data, audio_data, arms)
 
         Raises:
             RuntimeError: If failed to process observation data.
@@ -154,10 +195,7 @@ class RakudaSaveWorker(SaveWorker[RakudaObs]):
             if not camera_data:
                 raise ValueError("Camera data is missing.")
 
-            leader = obs.arms.leader
-            follower = obs.arms.follower
-
-            return camera_data, tactile_data, audio_data, leader, follower
+            return camera_data, tactile_data, audio_data, obs.arms
 
         except Exception as e:
             raise RuntimeError(f"Failed to process Rakuda observation data: {e}")
@@ -412,34 +450,73 @@ class RakudaSaveWorker(SaveWorker[RakudaObs]):
         H5Handler.save_hierarchical(data_dict, file_path, compress=True)
         logger.info(f"Hierarchical data saved to {file_path}")
 
+    def _arm_attributes(self, control: Mapping[str, Any]) -> Dict[str, str | int | float]:
+        """The ``arm`` group attributes of spec §8.3 from ``control_report()``.
+
+        Only ``str``/``int``/``float`` values: ``H5Handler`` turns a list into
+        a float32 dataset, so lists are comma-joined and integers stay scalar
+        (``t0_monotonic_ns`` is stored as int64).
+        """
+        motors = control.get("motors", {})
+        names = list(motors.get("names") or RAKUDA_JOINT_NAMES)
+        attributes: Dict[str, str | int | float] = {
+            "schema_version": ARM_SCHEMA_VERSION,
+            "joint_names": ",".join(names),
+            **_ARM_UNITS,
+            "control_mode": str(control.get("mode", "position_teleop")),
+            "record_fps": int(self.fps),
+            "current_sign_convention": "motor_raw",
+            "leader_current_sign": _sign_row(control.get("current_sign", {}), names),
+            "follower_current_sign": _sign_row(control.get("follower_current_sign", {}), names),
+            "time_origin": "monotonic_ns_at_record_start",
+        }
+        for side in ("leader", "follower"):
+            models = motors.get(f"{side}_models")
+            if models:
+                attributes[f"{side}_models"] = ",".join(models)
+        if "control_hz" in control:
+            attributes["control_hz"] = int(control["control_hz"])
+        record = control.get("record", {})
+        for key, value_type in _RECORD_ATTRIBUTES:
+            if record.get(key) is not None:
+                attributes[key] = value_type(record[key])
+        return attributes
+
     def _build_hierarchical_data(
         self,
         camera_data: Dict[str, NDArray[np.float32]],
         tactile_data: Dict[str, NDArray[np.float32]],
         audio_data: Dict[str, NDArray[np.float32]],
-        leader: NDArray[np.float32],
-        follower: NDArray[np.float32],
+        arms: RakudaArmObs,
+        control: Mapping[str, Any] | None = None,
     ) -> HierarchicalTaskData:
-        """Build hierarchical data structure for HDF5 storage.
+        """Build hierarchical data structure for HDF5 storage (schema v2, spec §8.3).
+
+        Every non-None array of ``arms`` becomes ``arm/<field>``
+        (``arm/leader`` and ``arm/follower`` as before); the ``*_t_ns`` stamps
+        are never written.  The scalar entries of ``arm`` become its attributes.
 
         Args:
             camera_data (Dict[str, NDArray[np.float32]]): Camera data by name.
             tactile_data (Dict[str, NDArray[np.float32]]): Tactile sensor data by name.
             audio_data (Dict[str, NDArray[np.float32]]): Audio sensor data by name.
-            leader (NDArray[np.float32]): Leader arm positions.
-            follower (NDArray[np.float32]): Follower arm positions.
+            arms (RakudaArmObs): Stacked arm observation of the recording.
+            control (Mapping[str, Any] | None): ``RakudaRobot.control_report()``.
 
         Returns:
             HierarchicalTaskData: Hierarchical data structure.
         """
+        arm_group: dict[str, NDArray[np.float32] | NDArray[np.uint8] | str | int | float] = {}
+        for name in RakudaArmObs.ARRAY_FIELDS:
+            value = getattr(arms, name)
+            if value is not None:
+                arm_group[name] = value
+        arm_group.update(self._arm_attributes(control or {}))
         hierarchical_data: HierarchicalTaskData = {
             "camera": {},
             "tactile": {},
             "audio": {},
-            "arm": {
-                "leader": leader,
-                "follower": follower,
-            },
+            "arm": arm_group,
         }
 
         # Add camera data to hierarchy
@@ -469,15 +546,16 @@ class RakudaSaveWorker(SaveWorker[RakudaObs]):
             save_path (str): Directory path to save the data.
             save_gif (bool): Whether to generate GIF animation.
         """
-        camera_data, tactile_data, audio_data, leader, follower = self.prepare_rakuda_obs(
-            obs, save_path
-        )
+        camera_data, tactile_data, audio_data, arms = self.prepare_rakuda_obs(obs, save_path)
+        control = None if self._control_report is None else self._control_report()
         table = Table(title="Rakuda Observation Save Summary")
         table.add_column("Data name", style="cyan", no_wrap=True)
         table.add_column("Shape", style="magenta")
 
-        table.add_row("Leader Arm Data", str(leader.shape))
-        table.add_row("Follower Arm Data", str(follower.shape))
+        for name in RakudaArmObs.ARRAY_FIELDS:
+            value = getattr(arms, name)
+            if value is not None:
+                table.add_row(f"Arm: {name}", str(value.shape))
         for name, data in camera_data.items():
             table.add_row(f"Camera: {name}", str(data.shape))
         for name, data in tactile_data.items():
@@ -491,7 +569,7 @@ class RakudaSaveWorker(SaveWorker[RakudaObs]):
 
         # Build hierarchical data structure for HDF5 format
         hierarchical_data = self._build_hierarchical_data(
-            camera_data, tactile_data, audio_data, leader, follower
+            camera_data, tactile_data, audio_data, arms, control
         )
 
         # Save as single HDF5 file (unified format)
@@ -509,7 +587,7 @@ class RakudaSaveWorker(SaveWorker[RakudaObs]):
         self.enqueue_save_task(
             SaveTask(
                 task_type="arm_obs",
-                data=(leader, follower),
+                data=(arms.leader, arms.follower),
                 save_path=os.path.join(save_path, "arm_obs.jpg"),
             )
         )
