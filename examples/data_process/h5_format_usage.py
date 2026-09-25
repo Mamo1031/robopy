@@ -1,16 +1,16 @@
 """
-サンプル：H5形式でのデータ保存と読み込みの使用例
+Example: saving and loading data in the H5 format.
 
-このスクリプトは、RakudaSaveWorkerを使用してH5形式で階層的な
-データを保存・読み込みする方法を示しています。
+Shows how hierarchical data is saved and loaded as H5 with ``H5Handler``
+and ``RakudaSaveWorker``.
 """
 
 import numpy as np
 
 from robopy.utils import H5Handler
 
-# rakuda_observations.h5 スキーマ v2 で追加された arm/ 配下のデータセット（任意）。
-# 旧ファイルには無いので、読む側は必ず `in` で確認する。
+# Optional datasets under arm/ added by rakuda_observations.h5 schema v2.
+# Older files lack them, so a reader must always check with `in`.
 OPTIONAL_ARM_DATASETS = (
     "leader_velocity",
     "follower_velocity",
@@ -23,9 +23,9 @@ OPTIONAL_ARM_DATASETS = (
 
 
 def example_hierarchical_save() -> None:
-    """階層的なデータ構造をH5形式で保存する例"""
+    """Saves a hierarchical data structure as H5."""
 
-    # 階層的なデータ構造を作成
+    # Build a hierarchical data structure
     hierarchical_data = {
         "camera": {
             "main": np.random.rand(100, 3, 480, 640).astype(np.float32),
@@ -41,18 +41,18 @@ def example_hierarchical_save() -> None:
         },
     }
 
-    # H5形式で保存
+    # Save as H5
     output_path = "output/rakuda_observations.h5"
     H5Handler.save_hierarchical(hierarchical_data, output_path, compress=True)
     print(f"✓ Saved hierarchical data to {output_path}")
 
-    # 保存されたファイル情報を確認
+    # Inspect the saved file
     info = H5Handler.get_info(output_path)
     print("\nFile structure:")
     for key, value in info.items():
         print(f"  {key}: shape={value['shape']}, dtype={value['dtype']}")
 
-    # データを読み込む
+    # Load the data
     loaded_data = H5Handler.load_hierarchical(output_path)
     print("✓ Loaded hierarchical data")
     camera_shapes = [data.shape for data in loaded_data["camera"].values()]
@@ -63,7 +63,7 @@ def example_hierarchical_save() -> None:
     follower_shape = loaded_data["arm"]["follower"].shape
     print(f"  Arm shapes: {leader_shape}, {follower_shape}")
 
-    # スキーマ v2 の追加データセット（速度・電流・時刻）は存在するときだけ読む
+    # Schema v2 datasets (velocity, current, time) are read only when present
     arm = loaded_data["arm"]
     for name in OPTIONAL_ARM_DATASETS:
         if name in arm:
@@ -71,17 +71,17 @@ def example_hierarchical_save() -> None:
 
 
 def example_single_array() -> None:
-    """単一の配列をH5形式で保存・読み込みする例"""
+    """Saves and loads a single array as H5."""
 
-    # 配列を作成
+    # Build an array
     data = np.random.rand(100, 7).astype(np.float32)
 
-    # 保存
+    # Save
     output_path = "output/arm_data.h5"
     H5Handler.save_single_array(data, output_path, dataset_name="leader_arm")
     print(f"✓ Saved single array to {output_path}")
 
-    # 読み込み
+    # Load
     loaded_array = H5Handler.load_single_array(output_path, dataset_name="leader_arm")
     print(f"✓ Loaded array with shape: {loaded_array.shape}")
     matches = np.allclose(data, loaded_array)
@@ -89,24 +89,24 @@ def example_single_array() -> None:
 
 
 # ========================================
-# 例3: RakudaSaveWorkerでの使用
+# Example 3: RakudaSaveWorker
 # ========================================
 
 
 def example_rakuda_save_worker() -> None:
-    """RakudaSaveWorkerでH5形式のデータ保存を使用する例"""
+    """Saves H5 data through RakudaSaveWorker."""
 
-    # RakudaConfigを設定（実際の使用時）
+    # Configure RakudaConfig (in real use)
     # config = RakudaConfig(...)
     # worker = RakudaSaveWorker(config, worker_num=4, fps=20)
 
     # obs = robot.record(max_frame=100, fps=20)
     # worker.save_all_obs(obs, save_path="data/experiment_01", save_gif=True)
 
-    # 実行後、以下のファイルが生成される:
-    # - data/experiment_01/rakuda_observations.h5  # 主要データ
-    # - data/experiment_01/arm_obs.png             # 腕観測の可視化
-    # - data/experiment_01/rakuda_obs_animation.gif # アニメーション（オプション）
+    # This produces the following files:
+    # - data/experiment_01/rakuda_observations.h5  # main data
+    # - data/experiment_01/arm_obs.png             # arm observation plot
+    # - data/experiment_01/rakuda_obs_animation.gif # animation (optional)
 
     print("✓ Example RakudaSaveWorker usage (commented for demo)")
     print("  Main output: rakuda_observations.h5")
@@ -127,14 +127,14 @@ def example_rakuda_save_worker() -> None:
 
 
 # ========================================
-# メイン実行
+# Main
 # ========================================
 
 
 if __name__ == "__main__":
     import os
 
-    # 出力ディレクトリを作成
+    # Create the output directory
     os.makedirs("output", exist_ok=True)
 
     print("=" * 60)
