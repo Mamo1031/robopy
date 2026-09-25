@@ -10,7 +10,7 @@ identification and connection code calls: ``open``/``close``/``set_port``,
 
 Each simulated motor keeps a byte-addressed register image (the X-series
 control table) and a toy plant.  The firmware behaviours that bite naive
-control code are reproduced on purpose (spec D21/D26/D27):
+control code are reproduced on purpose:
 
 * addresses below :data:`EEPROM_END_ADDRESS` are EEPROM: a write is silently
   ignored while ``TORQUE_ENABLE`` is 1 (so ``write_with_readback`` raises), and
@@ -33,8 +33,10 @@ control code are reproduced on purpose (spec D21/D26/D27):
 **This is a toy, not a dynamics model.**  ``PRESENT_CURRENT`` mirrors the
 commanded ``GOAL_CURRENT`` (in current mode with torque on) instead of being
 measured, the position-mode servo is a first-order lag, and gravity is an
-optional per-joint "holding current".  Gain stability and identification
-accuracy can only be judged on the real arm (spec §10.1).
+optional per-joint "holding current" (or, through
+:meth:`SimulatedDynamixelBus.set_coupled_gravity`, a function of the whole
+pose).  Gain stability and identification
+accuracy can only be judged on the real arm.
 """
 
 from __future__ import annotations
@@ -76,6 +78,7 @@ __all__ = [
     "POWER_ON_GOAL_CURRENT",
     "TORQUE_ON_RESETS_GOAL_CURRENT",
     "VELOCITY_UNIT_COUNTS_PER_S",
+    "CoupledGravity",
     "GoalCurrentPolicy",
     "SimClock",
     "SimulatedDynamixelBus",
@@ -86,20 +89,24 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 GoalCurrentPolicy = Literal["limit", "zero", "keep"]
+#: ``fn({motor: position_counts}) -> {motor: holding current}``; see
+#: :meth:`SimulatedDynamixelBus.set_coupled_gravity`.
+CoupledGravity = Callable[[Mapping[str, float]], Mapping[str, float]]
 
 #: What ``GOAL_CURRENT`` becomes when ``OPERATING_MODE`` changes: ``"limit"``
-#: (the value of ``CURRENT_LIMIT``, the assumption behind spec D26),
-#: ``"zero"`` or ``"keep"``.  To be confirmed on hardware in §11 step 7b.
+#: (the value of ``CURRENT_LIMIT``, the worst case that ``configure()`` guards
+#: against by reading ``GOAL_CURRENT`` back), ``"zero"`` or ``"keep"``.  Not
+#: measured on the real firmware, to be checked during hardware bring-up.
 MODE_CHANGE_GOAL_CURRENT: GoalCurrentPolicy = "limit"
 #: When True, a ``TORQUE_ENABLE`` 0 -> 1 transition also sets ``GOAL_CURRENT``
-#: to ``CURRENT_LIMIT``; the loop's post-torque-on read-back (D26 step 9) must
-#: catch that.  Default False (the e-Manual documents no such reset).
+#: to ``CURRENT_LIMIT``; the loop's post-torque-on read-back must catch
+#: that.  Default False (the e-Manual documents no such reset).
 TORQUE_ON_RESETS_GOAL_CURRENT: bool = False
 #: ``GOAL_CURRENT`` after a power cycle: ``"zero"`` or ``"limit"``.
 POWER_ON_GOAL_CURRENT: GoalCurrentPolicy = "zero"
 
 #: Approximate SDK packet timeout of one legacy ``sync_read`` attempt on a
-#: 17-motor bus (spec §3.1: ten retries of about 36.6 ms).
+#: 17-motor bus (ten retries of about 36.6 ms).
 LEGACY_READ_TIMEOUT_S: float = 0.0366
 #: One raw ``PRESENT_VELOCITY`` count is 0.229 rpm.
 VELOCITY_UNIT_COUNTS_PER_S: float = 0.229 * 4096.0 / 60.0
@@ -461,6 +468,7 @@ class SimulatedDynamixelBus:
             name: SimulatedMotorRegisters(motor, (joints or {}).get(name) or SimulatedJoint())
             for name, motor in self.motors.items()
         }
+        self._coupled_gravity: CoupledGravity | None = None
         self._plant_ns = self.clock.monotonic_ns()
 
     # -- test controls ------------------------------------------------------
@@ -508,13 +516,35 @@ class SimulatedDynamixelBus:
         self._advance_clock(seconds)
         self._catch_up()
 
+    def set_coupled_gravity(self, fn: CoupledGravity | None) -> None:
+        """Replaces the per-joint gravity by a function of every joint's position.
+
+        ``fn({name: position_counts})`` returns ``{name: holding current}`` in
+        the count frame (the convention of :attr:`SimulatedJoint.gravity_ma`)
+        for the joints whose gravity depends on the whole arm pose; joints it
+        does not return keep their own ``gravity_ma``.  It is evaluated once
+        per :meth:`step` at the positions the step starts from.  ``None``
+        restores the per-joint gravity everywhere.
+        """
+        with self._lock:
+            self._coupled_gravity = fn
+
     def step(self, dt: float) -> None:
         """Integrates every joint by ``dt`` seconds under its current command."""
         if dt <= 0.0:
             return
         with self._lock:
-            for registers in self._registers.values():
-                self._integrate(registers, dt)
+            coupled: Mapping[str, float] = {}
+            if self._coupled_gravity is not None:
+                coupled = self._coupled_gravity(
+                    {name: r.joint.position_counts for name, r in self._registers.items()}
+                )
+                unknown = [name for name in coupled if name not in self._registers]
+                if unknown:
+                    raise ValueError(f"coupled gravity names unknown motor(s): {unknown}")
+            for name, registers in self._registers.items():
+                gravity = coupled.get(name)
+                self._integrate(registers, dt, None if gravity is None else float(gravity))
             self._plant_ns = self.clock.monotonic_ns()
 
     # -- bus surface: lifecycle ----------------------------------------------
@@ -935,7 +965,10 @@ class SimulatedDynamixelBus:
 
     # -- internals: plant ----------------------------------------------------
 
-    def _integrate(self, registers: SimulatedMotorRegisters, dt: float) -> None:
+    def _integrate(
+        self, registers: SimulatedMotorRegisters, dt: float, gravity_ma: float | None = None
+    ) -> None:
+        """One ``step`` of one joint; ``gravity_ma`` overrides the joint's own gravity."""
         joint = registers.joint
         torque_on = registers.torque_enable == 1
         mode = registers.operating_mode
@@ -951,7 +984,8 @@ class SimulatedDynamixelBus:
             remaining -= h
             position = joint.position_counts
             velocity = joint.velocity_counts_per_s
-            net_ma = command_ma - joint.gravity_at(position) + joint.contact_at(position)
+            gravity = joint.gravity_at(position) if gravity_ma is None else gravity_ma
+            net_ma = command_ma - gravity + joint.contact_at(position)
             if abs(velocity) > 1e-9:
                 net_ma -= math.copysign(joint.coulomb_ma, velocity)
             elif abs(net_ma) <= joint.coulomb_ma:
