@@ -122,7 +122,7 @@ CURRENT_LIMIT_MAX_RAW: Dict[str, int] = {
 
 #: Nominal torque constant in N·m/A, for display and logging only.  These are
 #: datasheet ratios (stall torque over stall current), not a validated torque
-#: model; control and identification work in milliamps (spec D8).
+#: model; control and identification work in milliamps.
 TORQUE_CONSTANT_NM_PER_A: Dict[str, float] = {
     "xc330-t288": 1.15,
     "xm430-w350": 1.78,
