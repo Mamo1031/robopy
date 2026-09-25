@@ -1,14 +1,18 @@
-"""User overrides for Rakuda from ``.robopy/rakuda/config.yaml`` (spec §7.3).
+"""User overrides for Rakuda from ``.robopy/rakuda/config.yaml``.
 
 Every value that is ``null`` (or absent) leaves the ``RakudaConfig`` built in
-code untouched, so the generated default file changes nothing. Priority is
-CLI/code > YAML > dataclass defaults.
+code untouched, so the generated default file changes nothing. A non-null YAML
+value overrides the value in code, including command-line flags that a script
+has put into the config; the rule is YAML (non-null) > code > dataclass
+defaults. When the YAML replaces a value the caller set explicitly, one
+WARNING per key names both values.
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import fields, replace
+from functools import reduce
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Collection, Mapping
 
@@ -157,6 +161,40 @@ def _apply_bilateral_overrides(
         if key in kwargs:
             kwargs[key] = replace(getattr(base, key), **kwargs[key])
     return replace(base, **kwargs)
+
+
+def _warn_override(yaml_path: Path, key: str, code_value: Any, yaml_value: Any) -> None:
+    logger.warning(
+        "config.yaml overrides %s: code %r -> yaml %r (edit or remove it in %s to use the "
+        "code value)",
+        key,
+        code_value,
+        yaml_value,
+        yaml_path,
+    )
+
+
+def _warn_bilateral_overrides(
+    yaml_path: Path,
+    base: RakudaBilateralParams,
+    applied: RakudaBilateralParams,
+    overrides: Mapping[str, Any],
+) -> None:
+    """Warns for every overridden ``bilateral`` key whose code value is not the default.
+
+    A code value equal to the ``RakudaBilateralParams()`` default is taken as
+    "not set by the caller", so overriding it is silent.
+    """
+
+    from robopy.config.robot_config.rakuda_config import RakudaBilateralParams
+
+    defaults = RakudaBilateralParams()
+    for key, value in overrides.items():
+        paths = [(key, sub) for sub in value] if key in _NESTED_BILATERAL_KEYS else [(key,)]
+        for path in paths:
+            default, code, new = (reduce(getattr, path, obj) for obj in (defaults, base, applied))
+            if code != default and new != code:
+                _warn_override(yaml_path, "bilateral." + ".".join(path), code, new)
 
 
 def get_dotrobopy_dir(base_dir: Path | None = None) -> Path:
@@ -339,6 +377,12 @@ def apply_rakuda_dotconfig(
     ``dataclasses.replace`` onto ``cfg.bilateral`` and ignored (INFO) when
     ``cfg.bilateral`` is None. Unknown keys inside the known sections raise
     ``ValueError``.
+
+    One WARNING is logged per key where the YAML replaces a value the caller
+    set explicitly: a port that differs (ports are always explicit), a
+    ``torque_enabled`` list or ``hold_on_disconnect`` that is not None in
+    ``cfg`` and differs, and a ``bilateral`` key whose ``cfg`` value differs
+    from the ``RakudaBilateralParams()`` default and from the YAML value.
     """
 
     # Local import to avoid circular dependency in robopy.config package.
@@ -385,18 +429,31 @@ def apply_rakuda_dotconfig(
     leader_port = _parse_port_yaml(leader.get("port"), field_name="leader.port")
     if leader_port is not None:
         updates["leader_port"] = leader_port
+        if leader_port != cfg.leader_port:
+            _warn_override(yaml_path, "leader.port", cfg.leader_port, leader_port)
     follower_port = _parse_port_yaml(follower.get("port"), field_name="follower.port")
     if follower_port is not None:
         updates["follower_port"] = follower_port
-    if leader_torque_enabled is not None:
-        updates["leader_torque_enabled"] = leader_torque_enabled
-    if follower_torque_enabled is not None:
-        updates["follower_torque_enabled"] = follower_torque_enabled
+        if follower_port != cfg.follower_port:
+            _warn_override(yaml_path, "follower.port", cfg.follower_port, follower_port)
+    for side, yaml_joints, code_joints in (
+        ("leader", leader_torque_enabled, cfg.leader_torque_enabled),
+        ("follower", follower_torque_enabled, cfg.follower_torque_enabled),
+    ):
+        if yaml_joints is None:
+            continue
+        updates[f"{side}_torque_enabled"] = yaml_joints
+        if code_joints is not None and set(code_joints) != set(yaml_joints):
+            _warn_override(yaml_path, f"{side}.torque_enabled", code_joints, yaml_joints)
     hold_on_disconnect = _parse_bool_yaml(
         safety.get("hold_on_disconnect"), field_name="safety.hold_on_disconnect"
     )
     if hold_on_disconnect is not None:
         updates["hold_on_disconnect"] = hold_on_disconnect
+        if cfg.hold_on_disconnect is not None and cfg.hold_on_disconnect != hold_on_disconnect:
+            _warn_override(
+                yaml_path, "safety.hold_on_disconnect", cfg.hold_on_disconnect, hold_on_disconnect
+            )
     if bilateral_overrides:
         if cfg.bilateral is None:
             logger.info(
@@ -406,7 +463,9 @@ def apply_rakuda_dotconfig(
                 sorted(bilateral_overrides),
             )
         else:
-            updates["bilateral"] = _apply_bilateral_overrides(cfg.bilateral, bilateral_overrides)
+            applied = _apply_bilateral_overrides(cfg.bilateral, bilateral_overrides)
+            _warn_bilateral_overrides(yaml_path, cfg.bilateral, applied, bilateral_overrides)
+            updates["bilateral"] = applied
 
     if not updates:
         return cfg
