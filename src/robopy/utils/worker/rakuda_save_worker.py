@@ -31,7 +31,7 @@ logger = getLogger(__name__)
 
 console = Console()
 
-#: Schema of the ``arm`` group of ``rakuda_observations.h5`` (spec §8.3).
+#: Schema of the ``arm`` group of ``rakuda_observations.h5``.
 ARM_SCHEMA_VERSION = 2
 _ARM_UNITS: Dict[str, str] = {
     "position_unit": "count",
@@ -68,7 +68,7 @@ class RakudaSaveWorker(SaveWorker[RakudaObs]):
             worker_num: Threads of the save pool.
             fps: Recording rate, written as ``arm@record_fps``.
             control_report: ``RakudaRobot.control_report``; called when an
-                observation is saved to fill the ``arm`` attributes of spec §8.3.
+                observation is saved to fill the ``arm`` group attributes.
                 None writes the schema attributes only.
         """
         super().__init__(worker_num=worker_num)
@@ -451,7 +451,7 @@ class RakudaSaveWorker(SaveWorker[RakudaObs]):
         logger.info(f"Hierarchical data saved to {file_path}")
 
     def _arm_attributes(self, control: Mapping[str, Any]) -> Dict[str, str | int | float]:
-        """The ``arm`` group attributes of spec §8.3 from ``control_report()``.
+        """The ``arm`` group attributes from ``control_report()``.
 
         Only ``str``/``int``/``float`` values: ``H5Handler`` turns a list into
         a float32 dataset, so lists are comma-joined and integers stay scalar
@@ -490,7 +490,7 @@ class RakudaSaveWorker(SaveWorker[RakudaObs]):
         arms: RakudaArmObs,
         control: Mapping[str, Any] | None = None,
     ) -> HierarchicalTaskData:
-        """Build hierarchical data structure for HDF5 storage (schema v2, spec §8.3).
+        """Build hierarchical data structure for HDF5 storage (schema v2).
 
         Every non-None array of ``arms`` becomes ``arm/<field>``
         (``arm/leader`` and ``arm/follower`` as before); the ``*_t_ns`` stamps
