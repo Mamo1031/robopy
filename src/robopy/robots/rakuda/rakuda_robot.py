@@ -1,20 +1,23 @@
+import importlib.metadata
+import os
 import queue
 import threading
 import time
 from collections import defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor
 from logging import getLogger
-from typing import Dict, List
+from typing import Any, Dict, List, Literal
 
+import dynamixel_sdk
 import numpy as np
 from numpy.typing import NDArray
 from rich.console import Console
 from rich.table import Table
 
-from robopy.config.dotrobopy import apply_rakuda_dotconfig
 from robopy.config.robot_config.rakuda_config import (
     RAKUDA_MOTOR_MAPPING,
     RakudaArmObs,
+    RakudaArmState,
     RakudaConfig,
     RakudaObs,
     RakudaSensorConfigs,
@@ -27,18 +30,86 @@ from robopy.sensors.tactile import DigitSensor
 from robopy.sensors.visual import RealsenseCamera
 
 from ..common.composed import ComposedRobot
+from .rakuda_arm import BusFactory
+from .rakuda_leader_control import BilateralNotReady, FollowerLost, LoopStopped
 from .rakuda_pair_sys import RakudaPairSys
 
 logger = getLogger(__name__)
 
+#: Why a recording ended. ``loop_fault`` is reported by the bilateral loop.
+TerminatedBy = Literal["max_frame", "keyboard_interrupt", "teleop_stopped", "loop_fault"]
+
+
+def _stop_reason(error: BaseException | None) -> TerminatedBy:
+    """Why a recording ended before ``max_frame``.
+
+    ``loop_fault`` when the bilateral loop latched a fault (the ``LoopStopped``
+    it raised carries it), ``teleop_stopped`` for every other stop.
+    """
+    if isinstance(error, LoopStopped) and error.fault is not None:
+        return "loop_fault"
+    return "teleop_stopped"
+
+
+def _dynamixel_sdk_info() -> Dict[str, str | None]:
+    """Installed ``dynamixel_sdk`` version and location, for ``control_report()``."""
+    try:
+        version: str | None = importlib.metadata.version("dynamixel_sdk")
+    except importlib.metadata.PackageNotFoundError:
+        version = None
+    path = getattr(dynamixel_sdk, "__file__", None)
+    return {"version": version, "path": None if path is None else os.path.dirname(path)}
+
+
+class _Sampler:
+    """Per-recording counters of the frame sampler.
+
+    ``duplicate_snapshots`` counts committed frames whose ``follower_time_s``
+    equals the previous frame's, i.e. the follower snapshot did not change.
+    """
+
+    def __init__(self) -> None:
+        self.queue_empty_waits = 0
+        self.over_budget_frames = 0
+        self.duplicate_snapshots = 0
+        self._last_follower_time_s: float | None = None
+
+    def commit(self, obs: RakudaArmObs) -> None:
+        """Accounts one committed (stamped) frame."""
+        if obs.follower_time_s is None:
+            return
+        follower_time_s = float(obs.follower_time_s)
+        if follower_time_s == self._last_follower_time_s:
+            self.duplicate_snapshots += 1
+        self._last_follower_time_s = follower_time_s
+
+    def as_dict(self, frames: int) -> Dict[str, int]:
+        return {
+            "frames": frames,
+            "queue_empty_waits": self.queue_empty_waits,
+            "over_budget_frames": self.over_budget_frames,
+            "duplicate_snapshots": self.duplicate_snapshots,
+        }
+
 
 class RakudaRobot(ComposedRobot[RakudaPairSys, Sensors, RakudaObs]):
-    def __init__(self, cfg: RakudaConfig):
-        cfg = apply_rakuda_dotconfig(cfg)
-        self.config = cfg
-        self._pair_sys = RakudaPairSys(cfg)
+    def __init__(self, cfg: RakudaConfig, bus_factory: BusFactory | None = None):
+        """Builds the arm pair and the sensors; no serial port is opened here.
+
+        Args:
+            cfg: Robot configuration.  ``RakudaPairSys`` applies the
+                ``.robopy/rakuda/config.yaml`` overrides and owns the config
+                from here on (see the ``config`` property).
+            bus_factory: ``(port, motors) -> bus`` handed to both arms;
+                defaults to the real ``DynamixelBus`` (tests inject simulated buses).
+        """
+        self._pair_sys = RakudaPairSys(cfg, bus_factory)
         self._sensor_configs: RakudaSensorConfigs = self._init_config()
         self._sensors: Sensors = self._init_sensors()
+        # Facts of the last recording for control_report().
+        self._last_record_t0_ns: int | None = None
+        self._last_record_stats: Dict[str, int] = {}
+        self._last_record_summary: Dict[str, Any] = {}
 
     def connect(self) -> None:
         try:
@@ -48,6 +119,11 @@ class RakudaRobot(ComposedRobot[RakudaPairSys, Sensors, RakudaObs]):
             raise e
 
     def disconnect(self) -> None:
+        """Disconnects the arms, then the sensors.
+
+        ``RakudaPairSys.disconnect()`` holds both arms first when the bilateral
+        loop is running (``stop_bilateral()``, never raises).
+        """
         self._pair_sys.disconnect()
 
         for cam in self._sensors.cameras or []:
@@ -60,7 +136,15 @@ class RakudaRobot(ComposedRobot[RakudaPairSys, Sensors, RakudaObs]):
             audio.disconnect()
 
     def teleoperation(self, max_seconds: float | None = None) -> None:
-        """Start teleoperation for Rakuda robot."""
+        """Leader drives follower until ``max_seconds`` (if positive) elapse or Ctrl-C.
+
+        ``RakudaPairSys.teleoperate()`` in both modes.  Conventional mode is
+        unchanged (Ctrl-C is swallowed there and the follower released).  In
+        bilateral mode the pair system starts the loop if needed, watches it,
+        and re-raises ``KeyboardInterrupt`` after holding both arms as well as
+        ``LoopStopped``/``FollowerLost``; nothing is swallowed here, so
+        ``record_save`` ends in one go.
+        """
         if not self.is_connected:
             raise ConnectionError("RakudaRobot is not connected. Call connect() first.")
 
@@ -76,26 +160,43 @@ class RakudaRobot(ComposedRobot[RakudaPairSys, Sensors, RakudaObs]):
         if max_frame <= 0:
             raise ValueError("max_frame must be greater than 0.")
 
-        leader_obs: List[NDArray[np.float32]] = []
-        follower_obs: List[NDArray[np.float32]] = []
+        # Bilateral: start the loop, or re-align the follower, before the
+        # recording clock starts; a failure propagates as is.
+        self._pair_sys.ensure_bilateral_running()
+
+        arm_frames: List[RakudaArmObs] = []
         camera_obs: Dict[str, List[NDArray[np.float32] | None]] = defaultdict(list)
         tactile_obs: Dict[str, List[NDArray[np.float32] | None]] = defaultdict(list)
         audio_obs: Dict[str, List[NDArray[np.float32] | None]] = defaultdict(list)
 
         get_obs_interval = 1.0 / fps
         frame_count = 0
-        interval_start = time.time()
+        teleop_steps = 0
+        sampler = _Sampler()
+        terminated_by: TerminatedBy = "max_frame"
+        loop_error: Exception | None = None
+        # The time origin of every *_time_s in this recording.
+        t0_ns = time.monotonic_ns()
+        t0_unix_s = time.time()
+        self._last_record_t0_ns = t0_ns
+        interval_start = time.monotonic()
 
         try:
             while frame_count < max_frame:
-                temp_arm_obs = self.robot_system.teleoperate_step()
+                try:
+                    temp_arm_obs = self.robot_system.teleoperate_step()
+                except BilateralNotReady as e:
+                    # A late pair is not a stop: the loop is still RUNNING.
+                    logger.warning("No fresh leader/follower pair: %s", e)
+                    continue
+                teleop_steps += 1
 
-                if time.time() - interval_start < get_obs_interval:
+                if time.monotonic() - interval_start < get_obs_interval:
                     continue
 
-                arm_obs = temp_arm_obs
-                leader_obs.append(arm_obs.leader)
-                follower_obs.append(arm_obs.follower)
+                arm_obs = temp_arm_obs.stamped(t0_ns=t0_ns, frame_t_ns=time.monotonic_ns())
+                arm_frames.append(arm_obs)
+                sampler.commit(arm_obs)
 
                 sensor_data = self.sensors_observation()
                 camera_data = sensor_data.cameras
@@ -112,18 +213,32 @@ class RakudaRobot(ComposedRobot[RakudaPairSys, Sensors, RakudaObs]):
                     audio_obs[audio_name].append(audio_frame)
 
                 frame_count += 1
-                interval_start = time.time()
+                interval_start = time.monotonic()
 
         except KeyboardInterrupt:
             logger.info("Recording interrupted by user.")
+            terminated_by = "keyboard_interrupt"
+        except (LoopStopped, FollowerLost) as e:
+            # The bilateral loop ended the episode (it holds or keeps running as
+            # it is); the frames collected so far are returned.
+            logger.warning("The bilateral loop ended the recording: %s", e)
+            terminated_by = _stop_reason(e)
+            loop_error = e
         except Exception as e:
             logger.error(f"An error occurred during recording: {e}")
             raise e
 
-        # process observations to numpy arrays
-        leader_obs_np = np.array(leader_obs)
-        follower_obs_np = np.array(follower_obs)
-        arms: RakudaArmObs = RakudaArmObs(leader=leader_obs_np, follower=follower_obs_np)
+        self._finish_record(
+            terminated_by=terminated_by,
+            frames=frame_count,
+            frames_requested=max_frame,
+            t0_ns=t0_ns,
+            t0_unix_s=t0_unix_s,
+            teleop_steps=teleop_steps,
+            worker_error=loop_error,
+            sampler=sampler,
+        )
+        arms = RakudaArmObs.stack(arm_frames)
         # process camera observations
         camera_obs_np: Dict[str, NDArray[np.float32] | None] = {}
         for cam_name, frames in camera_obs.items():
@@ -161,8 +276,8 @@ class RakudaRobot(ComposedRobot[RakudaPairSys, Sensors, RakudaObs]):
         max_processing_time_ms: float = 40,
     ) -> RakudaObs:
         """
-        teleoperate_stepをteleop_hzで回しつつ、fpsごとに最新のarm_obsを記録し、
-        センサデータは並列取得する高速記録。
+        Fast recording: runs teleoperate_step at teleop_hz, records the latest
+        arm_obs every frame at fps and reads the sensors in parallel.
         """
         if not self.is_connected:
             self.connect()
@@ -170,29 +285,57 @@ class RakudaRobot(ComposedRobot[RakudaPairSys, Sensors, RakudaObs]):
         if max_frame <= 0:
             raise ValueError("max_frame must be greater than 0.")
 
-        # arm_obsを高頻度で取得するためのキュー
+        # Bilateral: start the loop, or re-align the follower, before any
+        # thread exists; a failure propagates as is.
+        self._pair_sys.ensure_bilateral_running()
+
+        # Queue that carries arm_obs at the teleoperation rate
         arm_obs_queue: queue.Queue[RakudaArmObs] = queue.Queue(maxsize=teleop_hz * 2)
         stop_event = threading.Event()
+        worker_error: Exception | None = None
+        teleop_steps = 0
 
         def teleop_worker() -> None:
+            nonlocal worker_error, teleop_steps
             interval = 1.0 / teleop_hz
-            while not stop_event.is_set():
-                start_time = time.perf_counter()
-                obs = self.robot_system.teleoperate_step()
+            try:
+                while not stop_event.is_set():
+                    start_time = time.perf_counter()
+                    try:
+                        obs = self.robot_system.teleoperate_step()
+                    except BilateralNotReady as e:
+                        # A late pair is not a stop: the loop is still RUNNING.
+                        logger.warning("No fresh leader/follower pair: %s", e)
+                        continue
+                    teleop_steps += 1
 
-                try:
-                    arm_obs_queue.put(obs, timeout=interval)
-                except queue.Full:
-                    pass
-                elapsed = time.perf_counter() - start_time
-                sleep_time = max(0, interval - elapsed)
-                time.sleep(sleep_time)
+                    try:
+                        arm_obs_queue.put(obs, timeout=interval)
+                    except queue.Full:
+                        pass
+                    elapsed = time.perf_counter() - start_time
+                    sleep_time = max(0, interval - elapsed)
+                    time.sleep(sleep_time)
+            except (LoopStopped, FollowerLost) as e:
+                # The bilateral loop ended the episode; the sampler returns the
+                # frames collected so far.
+                worker_error = e
+                logger.warning("The bilateral loop stopped the recording: %s", e)
+            except Exception as e:
+                # A dead worker must end the recording, not starve it.
+                worker_error = e
+                logger.exception("Teleoperation worker stopped.")
+            finally:
+                stop_event.set()
 
+        # The time origin of every *_time_s in this recording.
+        t0_ns = time.monotonic_ns()
+        t0_unix_s = time.time()
+        self._last_record_t0_ns = t0_ns
         teleop_thread = threading.Thread(target=teleop_worker, daemon=True)
         teleop_thread.start()
 
-        leader_obs: List[NDArray[np.float32]] = []
-        follower_obs: List[NDArray[np.float32]] = []
+        arm_frames: List[RakudaArmObs] = []
         camera_obs: Dict[str, List[NDArray[np.float32] | None]] = defaultdict(list)
         tactile_obs: Dict[str, List[NDArray[np.float32] | None]] = defaultdict(list)
         audio_obs: Dict[str, List[NDArray[np.float32] | None]] = defaultdict(list)
@@ -200,8 +343,9 @@ class RakudaRobot(ComposedRobot[RakudaPairSys, Sensors, RakudaObs]):
         get_obs_interval = 1.0 / fps
         max_processing_time = max_processing_time_ms / 1000.0
         frame_count = 0
-        skipped_frames = 0
         total_processing_time = 0.0
+        sampler = _Sampler()
+        terminated_by: TerminatedBy = "max_frame"
 
         logger.info(f"Starting parallel recording: {max_frame} frames at {fps}Hz")
         logger.info(
@@ -210,10 +354,10 @@ class RakudaRobot(ComposedRobot[RakudaPairSys, Sensors, RakudaObs]):
         )
 
         try:
-            while frame_count < max_frame:
+            while frame_count < max_frame and not stop_event.is_set():
                 frame_start_time = time.perf_counter()
 
-                # 最新のarm_obsを取得（バッファが空なら待つ）
+                # Take the latest arm_obs (wait while the buffer is empty)
                 try:
                     while True:
                         arm_obs = arm_obs_queue.get(timeout=get_obs_interval)
@@ -221,10 +365,11 @@ class RakudaRobot(ComposedRobot[RakudaPairSys, Sensors, RakudaObs]):
                             arm_obs = arm_obs_queue.get_nowait()
                         break
                 except queue.Empty:
+                    sampler.queue_empty_waits += 1
                     logger.warning("No arm_obs available in time.")
                     continue
 
-                # センサデータは並列取得
+                # Read the sensors in parallel
                 try:
                     with ThreadPoolExecutor(max_workers=4) as executor:
                         # Camera futures
@@ -286,9 +431,10 @@ class RakudaRobot(ComposedRobot[RakudaPairSys, Sensors, RakudaObs]):
                                 )
                                 audio_data[audio_name] = None
 
-                    # 記録
-                    leader_obs.append(arm_obs.leader)
-                    follower_obs.append(arm_obs.follower)
+                    # Record
+                    stamped = arm_obs.stamped(t0_ns=t0_ns, frame_t_ns=time.monotonic_ns())
+                    arm_frames.append(stamped)
+                    sampler.commit(stamped)
 
                     for cam_name, cam_frame in camera_data.items():
                         camera_obs[cam_name].append(cam_frame)
@@ -302,12 +448,12 @@ class RakudaRobot(ComposedRobot[RakudaPairSys, Sensors, RakudaObs]):
                     frame_count += 1
                     logger.info("Recording progress: %s/%s frames", frame_count, max_frame)
 
-                    # タイミング調整
+                    # Timing
                     processing_time = time.perf_counter() - frame_start_time
                     total_processing_time += processing_time
 
                     if processing_time > max_processing_time:
-                        skipped_frames += 1
+                        sampler.over_budget_frames += 1
                         logger.warning(
                             f"""Frame {frame_count} took {processing_time * 1000:.1f}ms
                             (>{max_processing_time_ms}ms), skipping"""
@@ -325,6 +471,7 @@ class RakudaRobot(ComposedRobot[RakudaPairSys, Sensors, RakudaObs]):
 
         except KeyboardInterrupt:
             logger.info("Recording interrupted by user.")
+            terminated_by = "keyboard_interrupt"
         except Exception as e:
             logger.error(f"An error occurred during parallel recording: {e}")
             raise e
@@ -332,13 +479,25 @@ class RakudaRobot(ComposedRobot[RakudaPairSys, Sensors, RakudaObs]):
             stop_event.set()
             teleop_thread.join(timeout=1.0)
 
+        if terminated_by == "max_frame" and frame_count < max_frame:
+            terminated_by = _stop_reason(worker_error)
         avg_processing_time = total_processing_time / max(1, frame_count) * 1000
-        logger.info(f"Recording completed: {frame_count} frames, {skipped_frames} skipped")
+        logger.info(
+            f"Recording completed: {frame_count} frames, {sampler.over_budget_frames} over budget"
+        )
         logger.info(f"Average processing time: {avg_processing_time:.1f}ms")
 
-        leader_obs_np = np.array(leader_obs)
-        follower_obs_np = np.array(follower_obs)
-        arms: RakudaArmObs = RakudaArmObs(leader=leader_obs_np, follower=follower_obs_np)
+        self._finish_record(
+            terminated_by=terminated_by,
+            frames=frame_count,
+            frames_requested=max_frame,
+            t0_ns=t0_ns,
+            t0_unix_s=t0_unix_s,
+            teleop_steps=teleop_steps,
+            worker_error=worker_error,
+            sampler=sampler,
+        )
+        arms = RakudaArmObs.stack(arm_frames)
 
         camera_obs_np: Dict[str, NDArray[np.float32] | None] = {}
         for cam_name, frames in camera_obs.items():
@@ -375,10 +534,14 @@ class RakudaRobot(ComposedRobot[RakudaPairSys, Sensors, RakudaObs]):
         max_processing_time_ms: float = 40,
     ) -> RakudaObs:
         """
-        leaderは提供されたシーケンスを使用して再生し、follower及び他のobsを収集する。
+        Replays the given leader sequence and collects the follower and other observations.
+
+        Raises:
+            RuntimeError: While the bilateral loop is running.
         """
         if not self.is_connected:
             self.connect()
+        self._reject_while_bilateral_active("record_with_fixed_leader()")
 
         if max_frame <= 0:
             raise ValueError("max_frame must be greater than 0.")
@@ -386,51 +549,62 @@ class RakudaRobot(ComposedRobot[RakudaPairSys, Sensors, RakudaObs]):
         if len(leader_action) != max_frame:
             raise ValueError("Length of leader_action must match max_frame.")
 
-        # follower_obsを高頻度で取得するためのキュー
-        follower_obs_queue: queue.Queue[NDArray[np.float32]] = queue.Queue(maxsize=teleop_hz * 2)
+        # Queue that carries follower states at the teleoperation rate
+        follower_queue: queue.Queue[RakudaArmState] = queue.Queue(maxsize=teleop_hz * 2)
         stop_event = threading.Event()
+        worker_error: Exception | None = None
+        teleop_steps = 0
 
-        def control_worker():
+        def control_worker() -> None:
+            nonlocal worker_error, teleop_steps
             interval = 1.0 / teleop_hz
-            start_time = time.perf_counter()
+            start_time = time.perf_counter()  # interpolation only
 
-            while not stop_event.is_set():
-                loop_start = time.perf_counter()
-                t = loop_start - start_time
+            try:
+                while not stop_event.is_set():
+                    loop_start = time.perf_counter()
+                    t = loop_start - start_time
 
-                # 線形補間
-                # max_frameを超えた場合は最後のフレームを使用
-                idx_float = t * fps
-                if idx_float >= max_frame - 1:
-                    action = leader_action[-1]
-                else:
-                    idx0 = int(np.floor(idx_float))
-                    idx1 = min(idx0 + 1, max_frame - 1)
-                    alpha = idx_float - idx0
-                    action = (1 - alpha) * leader_action[idx0] + alpha * leader_action[idx1]
+                    # Linear interpolation; past max_frame the last frame is used
+                    idx_float = t * fps
+                    if idx_float >= max_frame - 1:
+                        action = leader_action[-1]
+                    else:
+                        idx0 = int(np.floor(idx_float))
+                        idx1 = min(idx0 + 1, max_frame - 1)
+                        alpha = idx_float - idx0
+                        action = (1 - alpha) * leader_action[idx0] + alpha * leader_action[idx1]
 
-                # フォロワーに送信
-                self.send_frame_action(action)
+                    # Send to the follower
+                    self.send_frame_action(action)
+                    teleop_steps += 1
 
-                # フォロワーの状態を取得
-                try:
-                    # get_observationはleaderも取得するが、followerのみ使用
-                    current_obs = self._pair_sys.get_observation()
-                    follower_obs_queue.put(current_obs.follower, timeout=interval)
-                except queue.Full:
-                    pass
-                except Exception as e:
-                    logger.error(f"Error in control_worker: {e}")
+                    # Read the follower state. A failed read propagates instead of
+                    # being swallowed: a silently empty queue would starve the sampler.
+                    follower_state = self._pair_sys.get_follower_state()
+                    try:
+                        follower_queue.put(follower_state, timeout=interval)
+                    except queue.Full:
+                        pass
 
-                elapsed = time.perf_counter() - loop_start
-                sleep_time = max(0, interval - elapsed)
-                time.sleep(sleep_time)
+                    elapsed = time.perf_counter() - loop_start
+                    sleep_time = max(0, interval - elapsed)
+                    time.sleep(sleep_time)
+            except Exception as e:
+                # A dead worker must end the recording, not starve it.
+                worker_error = e
+                logger.exception("Control worker stopped.")
+            finally:
+                stop_event.set()
 
+        # The time origin of every *_time_s in this recording.
+        t0_ns = time.monotonic_ns()
+        t0_unix_s = time.time()
+        self._last_record_t0_ns = t0_ns
         control_thread = threading.Thread(target=control_worker, daemon=True)
         control_thread.start()
 
-        leader_obs = []
-        follower_obs = []
+        arm_frames: List[RakudaArmObs] = []
         camera_obs: Dict[str, List] = defaultdict(list)
         tactile_obs: Dict[str, List] = defaultdict(list)
         audio_obs: Dict[str, List] = defaultdict(list)
@@ -438,27 +612,29 @@ class RakudaRobot(ComposedRobot[RakudaPairSys, Sensors, RakudaObs]):
         get_obs_interval = 1.0 / fps
         max_processing_time = max_processing_time_ms / 1000.0
         frame_count = 0
-        skipped_frames = 0
         total_processing_time = 0.0
+        sampler = _Sampler()
+        terminated_by: TerminatedBy = "max_frame"
 
         logger.info(f"Starting fixed leader recording: {max_frame} frames at {fps}Hz")
 
         try:
-            while frame_count < max_frame:
+            while frame_count < max_frame and not stop_event.is_set():
                 frame_start_time = time.perf_counter()
 
-                # 最新のfollower_obsを取得
+                # Take the latest follower state
                 try:
                     while True:
-                        current_follower = follower_obs_queue.get(timeout=get_obs_interval)
-                        while not follower_obs_queue.empty():
-                            current_follower = follower_obs_queue.get_nowait()
+                        current_follower = follower_queue.get(timeout=get_obs_interval)
+                        while not follower_queue.empty():
+                            current_follower = follower_queue.get_nowait()
                         break
                 except queue.Empty:
+                    sampler.queue_empty_waits += 1
                     logger.warning("No follower_obs available in time.")
                     continue
 
-                # センサデータは並列取得
+                # Read the sensors in parallel
                 try:
                     with ThreadPoolExecutor(max_workers=4) as executor:
                         # Camera futures
@@ -520,10 +696,17 @@ class RakudaRobot(ComposedRobot[RakudaPairSys, Sensors, RakudaObs]):
                                 )
                                 audio_data[audio_name] = None
 
-                    # 記録
-                    # leaderは提供されたアクションを使用
-                    leader_obs.append(leader_action[frame_count])
-                    follower_obs.append(current_follower)
+                    # Record
+                    # The leader is the given action (no read stamp -> leader_time_s None)
+                    stamped = RakudaArmObs(
+                        leader=leader_action[frame_count],
+                        follower=current_follower.position.astype(np.float32),
+                        follower_velocity=current_follower.velocity.astype(np.float32),
+                        follower_current=current_follower.current_ma,
+                        follower_t_ns=current_follower.t_end_ns,
+                    ).stamped(t0_ns=t0_ns, frame_t_ns=time.monotonic_ns())
+                    arm_frames.append(stamped)
+                    sampler.commit(stamped)
 
                     for cam_name, cam_frame in camera_data.items():
                         camera_obs[cam_name].append(cam_frame)
@@ -536,12 +719,12 @@ class RakudaRobot(ComposedRobot[RakudaPairSys, Sensors, RakudaObs]):
 
                     frame_count += 1
 
-                    # タイミング調整
+                    # Timing
                     processing_time = time.perf_counter() - frame_start_time
                     total_processing_time += processing_time
 
                     if processing_time > max_processing_time:
-                        skipped_frames += 1
+                        sampler.over_budget_frames += 1
                         logger.warning(
                             f"""Frame {frame_count} took {processing_time * 1000:.1f}ms
                             (>{max_processing_time_ms}ms), skipping"""
@@ -559,6 +742,7 @@ class RakudaRobot(ComposedRobot[RakudaPairSys, Sensors, RakudaObs]):
 
         except KeyboardInterrupt:
             logger.info("Recording interrupted by user.")
+            terminated_by = "keyboard_interrupt"
         except Exception as e:
             logger.error(f"An error occurred during parallel recording: {e}")
             raise e
@@ -566,13 +750,25 @@ class RakudaRobot(ComposedRobot[RakudaPairSys, Sensors, RakudaObs]):
             stop_event.set()
             control_thread.join(timeout=1.0)
 
+        if terminated_by == "max_frame" and frame_count < max_frame:
+            terminated_by = "teleop_stopped"
         avg_processing_time = total_processing_time / max(1, frame_count) * 1000
-        logger.info(f"Recording completed: {frame_count} frames, {skipped_frames} skipped")
+        logger.info(
+            f"Recording completed: {frame_count} frames, {sampler.over_budget_frames} over budget"
+        )
         logger.info(f"Average processing time: {avg_processing_time:.1f}ms")
 
-        leader_obs_np = np.array(leader_obs)
-        follower_obs_np = np.array(follower_obs)
-        arms: RakudaArmObs = RakudaArmObs(leader=leader_obs_np, follower=follower_obs_np)
+        self._finish_record(
+            terminated_by=terminated_by,
+            frames=frame_count,
+            frames_requested=max_frame,
+            t0_ns=t0_ns,
+            t0_unix_s=t0_unix_s,
+            teleop_steps=teleop_steps,
+            worker_error=worker_error,
+            sampler=sampler,
+        )
+        arms = RakudaArmObs.stack(arm_frames)
 
         camera_obs_np: Dict[str, NDArray[np.float32] | None] = {}
         for cam_name, frames in camera_obs.items():
@@ -600,6 +796,102 @@ class RakudaRobot(ComposedRobot[RakudaPairSys, Sensors, RakudaObs]):
         )
         return RakudaObs(arms=arms, sensors=sensors_obs)
 
+    def _finish_record(
+        self,
+        *,
+        terminated_by: TerminatedBy,
+        frames: int,
+        frames_requested: int,
+        t0_ns: int,
+        t0_unix_s: float,
+        teleop_steps: int,
+        worker_error: Exception | None,
+        sampler: _Sampler,
+    ) -> None:
+        """Stores the summary of the recording that just ended.
+
+        ``worker_error`` is the exception that stopped the teleoperation (the
+        worker's, or the loop's in the serial :meth:`record`), if any.
+
+        Raises:
+            RuntimeError: When no frame was collected; a partial recording is
+                returned by the caller otherwise.
+        """
+        elapsed_s = (time.monotonic_ns() - t0_ns) / 1e9
+        self._last_record_stats = sampler.as_dict(frames)
+        self._last_record_summary = {
+            "t0_monotonic_ns": t0_ns,
+            "t0_unix_s": t0_unix_s,
+            "duration_s": elapsed_s,
+            "frames": frames,
+            "frames_requested": frames_requested,
+            "terminated_by": terminated_by,
+            "teleop_hz_effective": teleop_steps / elapsed_s if elapsed_s > 0 else 0.0,
+            "worker_error": None if worker_error is None else repr(worker_error),
+        }
+        if worker_error is not None:
+            logger.warning("The teleoperation worker stopped the recording: %r", worker_error)
+        if frames == 0:
+            detail = "" if worker_error is None else f": {worker_error!r}"
+            raise RuntimeError(f"Recording ended ({terminated_by}) with 0 frames{detail}")
+
+    def control_report(self) -> Dict[str, Any]:
+        """Control-side facts for ``metadata.json`` and the HDF5 ``arm`` attributes.
+
+        The bilateral loop's report (``RakudaPairSys.control_report()``) when
+        the loop exists, otherwise the conventional position-teleoperation
+        report; both carry ``record``/``sampler`` of the last recording (empty
+        until one has ended) and the robot-level facts.  Every fault gets
+        ``t_s``, its time relative to the last recording's ``t0``, or None
+        outside that recording.
+        """
+        record = dict(self._last_record_summary)
+        pair = self._pair_sys
+        loop_report = pair.control_report()
+        report: Dict[str, Any] = (
+            {"mode": "position_teleop", "current_sign": {}}
+            if loop_report is None
+            else dict(loop_report)
+        )
+        report["record"] = record
+        report["faults"] = [
+            {**fault, "t_s": self._record_relative_s(fault.get("t_ns"))}
+            for fault in report.get("faults", [])
+        ]
+        report["teleop_hz_effective"] = record.get("teleop_hz_effective")
+        report["sampler"] = dict(self._last_record_stats)
+        report["motors"] = {
+            "names": list(pair.leader.motor_names),
+            "leader_models": list(pair.leader.motor_models),
+            "follower_models": list(pair.follower.motor_models),
+        }
+        report["dynamixel_sdk"] = _dynamixel_sdk_info()
+        report["ports"] = {"leader": pair.leader.port, "follower": pair.follower.port}
+        return report
+
+    def _record_relative_s(self, t_ns: int | None) -> float | None:
+        """Seconds of ``t_ns`` since the last recording's ``t0``.
+
+        None when no recording has ended yet or ``t_ns`` lies outside the
+        recording (before its ``t0`` or after its end).
+        """
+        record = self._last_record_summary
+        t0_ns = record.get("t0_monotonic_ns")
+        duration_s = record.get("duration_s")
+        if t_ns is None or t0_ns is None or duration_s is None:
+            return None
+        t_s = (t_ns - t0_ns) / 1e9
+        if t_s < 0.0 or t_s > duration_s:
+            return None
+        return t_s
+
+    def _reject_while_bilateral_active(self, operation: str) -> None:
+        """Refuses a follower-bus operation while the control thread owns both buses."""
+        if self._pair_sys.bilateral_active:
+            raise RuntimeError(
+                f"{operation}: bilateral loop is running; call stop_bilateral() first"
+            )
+
     def get_observation(self) -> RakudaObs:
         """get_observation get the current observation from the robot system and sensors."""
         if not self.is_connected:
@@ -610,7 +902,11 @@ class RakudaRobot(ComposedRobot[RakudaPairSys, Sensors, RakudaObs]):
         return RakudaObs(arms=arm_obs, sensors=sensor_obs)
 
     def get_arm_observation(self) -> RakudaArmObs:
-        """Get the current observation from the robot system (leader and follower positions)."""
+        """The current observation of both arms.
+
+        A direct read of both buses, or the latest snapshots of the control
+        thread while the bilateral loop is running (``RakudaPairSys`` decides).
+        """
         if not self.is_connected:
             raise ConnectionError("RakudaRobot is not connected. Call connect() first.")
 
@@ -690,6 +986,7 @@ class RakudaRobot(ComposedRobot[RakudaPairSys, Sensors, RakudaObs]):
 
         Raises:
             ConnectionError: RakudaRobot is not connected. Call connect() first.
+            RuntimeError: While the bilateral loop is running.
             ValueError: max_frame must be greater than 0.
             ValueError: Length of leader_action must match max_frame.
             ValueError: leader_action must be of shape (max_frame, 17).
@@ -697,6 +994,7 @@ class RakudaRobot(ComposedRobot[RakudaPairSys, Sensors, RakudaObs]):
         """
         if not self.is_connected:
             raise ConnectionError("RakudaRobot is not connected. Call connect() first.")
+        self._reject_while_bilateral_active("send()")
 
         if max_frame <= 0:
             raise ValueError("max_frame must be greater than 0.")
@@ -725,13 +1023,13 @@ class RakudaRobot(ComposedRobot[RakudaPairSys, Sensors, RakudaObs]):
                 if t > total_time:
                     break
 
-                # 現在時刻に対応するfpsインデックス
+                # Frame index for the current time
                 idx_float = t * fps
                 idx0 = int(np.floor(idx_float))
                 idx1 = min(idx0 + 1, max_frame - 1)
                 alpha = idx_float - idx0
 
-                # 線形補間
+                # Linear interpolation
                 action = (1 - alpha) * leader_action[idx0] + alpha * leader_action[idx1]
                 self.send_frame_action(action)
                 sent_count += 1
@@ -741,7 +1039,7 @@ class RakudaRobot(ComposedRobot[RakudaPairSys, Sensors, RakudaObs]):
                 while time.perf_counter() < next_time:
                     pass
 
-            # 最後のフレームを念のため送信
+            # Send the last frame once more to be sure
             self.send_frame_action(leader_action[-1])
 
             total_sent_count = ramp_sent_count + sent_count
@@ -765,6 +1063,11 @@ class RakudaRobot(ComposedRobot[RakudaPairSys, Sensors, RakudaObs]):
             raise e
 
     def send_frame_action(self, leader_action: NDArray[np.float32]) -> None:
+        """Send one leader-ordered action to the follower.
+
+        While the bilateral loop is running the pair system refuses the write
+        with ``RuntimeError``.
+        """
         self._pair_sys.send_follower_action(self._leader_action_to_follower_action(leader_action))
 
     def get_follower_frame_action(self) -> NDArray[np.float32]:
@@ -777,7 +1080,11 @@ class RakudaRobot(ComposedRobot[RakudaPairSys, Sensors, RakudaObs]):
         )
 
     def send_follower_frame_action(self, follower_action: NDArray[np.float32]) -> None:
-        """Send one action expressed directly in follower motor order."""
+        """Send one action expressed directly in follower motor order.
+
+        While the bilateral loop is running the pair system refuses the write
+        with ``RuntimeError``.
+        """
         action = np.asarray(follower_action, dtype=np.float32)
         follower_motor_names = list(self._pair_sys.follower.motors.motors.keys())
         if action.ndim != 1 or action.shape[0] != len(follower_motor_names):
@@ -910,6 +1217,16 @@ class RakudaRobot(ComposedRobot[RakudaPairSys, Sensors, RakudaObs]):
         console.print(table)
 
         return sensors
+
+    @property
+    def config(self) -> RakudaConfig:
+        """The robot configuration as the pair system holds it.
+
+        After ``connect()`` this names the ports actually opened: ``PORT_AUTO``
+        is resolved by ``RakudaPairSys``, and ``metadata.json`` records the
+        resolved ports through this property.
+        """
+        return self._pair_sys.config
 
     @property
     def sensor_configs(self) -> RakudaSensorConfigs:
