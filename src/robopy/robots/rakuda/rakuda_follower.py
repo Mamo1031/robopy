@@ -45,7 +45,7 @@ class RakudaFollower(RakudaArm):
         }
 
     def _apply_torque_policy(self, state: ConnectState) -> None:
-        """Follower torque policy (spec D15/D35), the same in both modes.
+        """Follower torque policy, the same in both modes.
 
         Motors that are on but not wanted are switched off, wanted motors that
         are off are switched on; a wanted motor that is already on is never
