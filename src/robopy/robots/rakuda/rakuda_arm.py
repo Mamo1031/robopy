@@ -1,17 +1,17 @@
 """Base class of the Rakuda arms: bus ownership and the connect-time sequence.
 
-``connect()`` follows the spec's fixed order (D13/D14/D15/D25):
+``connect()`` follows a fixed order:
 
-1. open the port and ``verify_models()`` (D13);
+1. open the port and ``verify_models()``;
 2. read ``OPERATING_MODE``/``TORQUE_ENABLE`` of all motors and ``GOAL_CURRENT``
-   of the current-capable joints, classify them (D25) and bring every
+   of the current-capable joints, classify them and bring every
    current-capable joint back to position mode without opening a new
-   torque-off window (``_restore_position_mode`` / ``_hold_now``, D40);
-3. write the grippers' EEPROM only where it differs from the code (D14);
-4. apply the side's torque policy (``_apply_torque_policy``, D15/D35), which
+   torque-off window (``_restore_position_mode`` / ``_hold_now``);
+3. write the grippers' EEPROM only where it differs from the code;
+4. apply the side's torque policy (``_apply_torque_policy``), which
    the subclasses implement.
 
-Nothing here starts the bilateral loop (D3).
+Nothing here starts the bilateral loop.
 """
 
 import logging
@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 #: Tests inject a ``SimulatedDynamixelBus`` (a documented drop-in) through it.
 BusFactory = Callable[[str, Dict[str, DynamixelMotor]], DynamixelBus]
 
-#: Connect-time state of one current-capable joint (spec D25, §6.6 table):
+#: Connect-time state of one current-capable joint:
 #: ``ok`` (mode 3, torque 0), ``held`` (3/1, a previous session's hold),
 #: ``stale_mode`` (0/0), ``stale_mode_torque_on`` (0/1) or ``unexpected``
 #: (any other mode).
@@ -47,7 +47,7 @@ _RELEASE_HINT = "run `robopy-rakuda-ports release --port {port} --side {side}`"
 
 #: Modes in which ``TORQUE_ENABLE=1`` makes the motor hold a position rather than
 #: drive ``GOAL_CURRENT``/``GOAL_VELOCITY``; the only ones a gripper may be
-#: torque-enabled in (spec §6.6: no path writes torque-on in current mode).
+#: torque-enabled in (no path writes torque-on in current mode).
 _POSITION_FAMILY_MODES = frozenset(
     {OperatingMode.POSITION, OperatingMode.EXTENDED_POSITION, OperatingMode.CURRENT_BASED_POSITION}
 )
@@ -105,14 +105,14 @@ class RakudaArm(Arm):
 
     @abstractmethod
     def _apply_torque_policy(self, state: ConnectState) -> None:
-        """Last step of ``connect()``: the side's ``TORQUE_ENABLE`` handling (spec D15/D35)."""
+        """Last step of ``connect()``: the side's ``TORQUE_ENABLE`` handling."""
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
     def set_port(self, port: str) -> None:
-        """Points the (closed) bus at ``port``; used to apply a resolved ``auto`` port (D17)."""
+        """Points the (closed) bus at ``port``; used to apply a resolved ``auto`` port."""
         self._motors.set_port(port)
         self._port = port
 
@@ -141,7 +141,7 @@ class RakudaArm(Arm):
     def disconnect(self, *, torque_off: bool = True) -> None:
         """Closes the port, switching every motor off first unless ``torque_off`` is False.
 
-        ``torque_off=False`` is the ``hold_on_disconnect`` path (spec D10): the
+        ``torque_off=False`` is the ``hold_on_disconnect`` path: the
         motors keep holding their last goal after the port is closed.
         """
         if not self._is_connected:
@@ -169,18 +169,18 @@ class RakudaArm(Arm):
             logger.warning(f"Failed to close {self._port} after a connect error: {e}")
 
     # ------------------------------------------------------------------
-    # Connect-time register handling (spec D25 / D14)
+    # Connect-time register handling
     # ------------------------------------------------------------------
 
     def _current_capable_joints(self) -> List[str]:
         return [name for name in RAKUDA_CURRENT_CAPABLE_JOINTS if name in self._motors.motors]
 
     def _classify_mode_state(self) -> ConnectState:
-        """Reads mode/torque of all motors and classifies the current-capable joints (D25).
+        """Reads mode/torque of all motors and classifies the current-capable joints.
 
         Grippers not in mode 5 and head joints not in mode 3 are only warned
         about; the grippers are fixed by :meth:`_write_gripper_eeprom`, the
-        head is never written (D40).
+        head is never written.
 
         Raises:
             ConnectionError: If a motor did not answer one of the three reads.
@@ -253,7 +253,7 @@ class RakudaArm(Arm):
         return rows
 
     def _recover_mode_state(self, state: ConnectState) -> None:
-        """Brings every current-capable joint back to position mode (D25 states C/D).
+        """Brings every current-capable joint back to position mode.
 
         Torque-off joints go through :meth:`_restore_position_mode`, torque-on
         joints through :meth:`_hold_now`; afterwards mode and torque are
@@ -295,7 +295,7 @@ class RakudaArm(Arm):
                 f"(OPERATING_MODE {not_position}); use the power switch."
             )
         if left_off:
-            # No GOAL_POSITION was written after the mode change (D27 H1): the
+            # No GOAL_POSITION was written after the mode change: the
             # torque policy must not enable these; refuse instead.
             raise ConnectionError(
                 f"cannot hold {list(left_off)}: no position reading; torque left OFF, "
@@ -305,10 +305,10 @@ class RakudaArm(Arm):
             state.classification[name] = "held" if state.torque.get(name) == 1 else "ok"
 
     def _restore_position_mode(self, names: Sequence[str], state: ConnectState) -> None:
-        """Mode 3 for torque-off joints found in another mode (state C); torque stays off.
+        """Mode 3 for torque-off joints found in another mode (``stale_mode``); torque stays off.
 
-        The goal is the position read *after* the mode change (one turn, D27
-        H2), so a later torque-on holds the joint where it is.
+        The goal is the position read *after* the mode change (one turn), so a
+        later torque-on holds the joint where it is.
         """
         bus = self._motors
         logger.warning(
@@ -329,7 +329,7 @@ class RakudaArm(Arm):
         bus.sync_write(XControlTable.GOAL_POSITION, {n: int(present[n]) for n in names})
 
     def _hold_now(self, names: Sequence[str], state: ConnectState) -> Tuple[str, ...]:
-        """Holds joints a previous session left in current mode with torque on (state D).
+        """Holds joints a previous session left in current mode with torque on.
 
         Runs :func:`hold_joints` on the calling thread; the joints are then
         ``held`` (mode 3, torque 1) like a normal previous hold.
@@ -374,18 +374,16 @@ class RakudaArm(Arm):
     def _write_gripper_eeprom(self, names: Sequence[str] = RAKUDA_GRIPPER_JOINT_NAMES) -> List[str]:
         """Gripper ``OPERATING_MODE``/``CURRENT_LIMIT`` where they differ, then ``GOAL_CURRENT``.
 
-        Spec D14.
-
         Only grippers that need a write and read torque 1 are switched off
         first; a ``CURRENT_LIMIT`` read-back mismatch is a warning. An
         ``OPERATING_MODE`` write is re-read afterwards: a gripper still outside
         the position family (3/4/5) would drive ``GOAL_CURRENT`` once torque
-        comes on, so it refuses the connect (spec §6.6). ``GOAL_CURRENT`` (RAM)
+        comes on, so it refuses the connect. ``GOAL_CURRENT`` (RAM)
         is written on every connect.
 
         Args:
             names: Grippers to handle; must be a subset of
-                ``RAKUDA_GRIPPER_JOINT_NAMES`` (D40, asserted).
+                ``RAKUDA_GRIPPER_JOINT_NAMES`` (asserted).
 
         Returns:
             The grippers whose torque was switched off for the write.
@@ -451,7 +449,8 @@ class RakudaArm(Arm):
         if wrong:
             raise ConnectionError(
                 f"gripper {list(wrong)} still in OPERATING_MODE {wrong} after the EEPROM write; "
-                "torque left OFF, use `robopy-rakuda-ports write-eeprom` or the power switch."
+                "torque left OFF; inspect it with `robopy-rakuda-ports show --port "
+                f"{self._port} --side {self.SIDE}`, power-cycle the arm and connect again."
             )
 
     def _switch_torque(
@@ -461,7 +460,7 @@ class RakudaArm(Arm):
         *,
         untouched: Collection[str] = (),
     ) -> None:
-        """Diff-based ``TORQUE_ENABLE`` (D15): off for on-and-unwanted, on for wanted-and-off.
+        """Diff-based ``TORQUE_ENABLE``: off for on-and-unwanted, on for wanted-and-off.
 
         A motor that is already on and wanted is never switched off; motors in
         ``untouched`` are not written at all.
