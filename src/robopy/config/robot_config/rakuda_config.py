@@ -23,15 +23,15 @@ class RakudaConfig:
     leader_torque_enabled: List[str] | None = None
     follower_torque_enabled: List[str] | None = None
     # Bilateral (leader current control) parameters. None -> conventional position
-    # teleoperation; the loop is enabled only by passing this in code (spec D2).
+    # teleoperation; the loop is enabled only by passing this in code.
     bilateral: "RakudaBilateralParams | None" = None
     # Keep both arms torque-on at their current position on disconnect. None -> True
-    # in bilateral mode, False in conventional mode (spec D10).
+    # in bilateral mode, False in conventional mode.
     hold_on_disconnect: bool | None = None
 
     @property
     def effective_hold_on_disconnect(self) -> bool:
-        """``hold_on_disconnect`` with the mode-dependent default resolved (spec D10)."""
+        """``hold_on_disconnect`` with the mode-dependent default resolved."""
         if self.hold_on_disconnect is not None:
             return self.hold_on_disconnect
         return self.bilateral is not None
@@ -64,10 +64,10 @@ class RakudaArmObs:
 
     Positions are encoder counts, velocities raw velocity counts (0.229 rpm per
     count, joint convention) and currents mA in the motor's own sign
-    convention (``PRESENT_CURRENT`` raw sign, spec D36).  Per frame the
+    convention (``PRESENT_CURRENT`` raw sign).  Per frame the
     arrays are ``(17,)`` and the times 0-d; after :meth:`stack` they are
     ``(N, 17)`` and ``(N,)``.  ``*_time_s`` are seconds since the
-    recording's ``t0`` (spec D37); consumers may only assume that
+    recording's ``t0``; consumers may only assume that
     ``frame_time_s`` is non-negative and non-decreasing and that
     ``leader_time_s``/``follower_time_s <= frame_time_s`` (the first
     ``leader_time_s`` can be slightly negative).
@@ -78,7 +78,7 @@ class RakudaArmObs:
     feed :meth:`stamped` and are never written to HDF5.
     """
 
-    #: Fields that hold arrays, in HDF5 dataset order (spec §8.3).
+    #: Fields that hold arrays, in HDF5 dataset order.
     ARRAY_FIELDS: ClassVar[Tuple[str, ...]] = (
         "leader",
         "follower",
@@ -105,7 +105,7 @@ class RakudaArmObs:
 
     @classmethod
     def from_states(cls, leader: "RakudaArmState", follower: "RakudaArmState") -> "RakudaArmObs":
-        """One frame from a leader and a follower state read (spec §8.1).
+        """One frame from a leader and a follower state read.
 
         Positions and velocities are widened to float32; ``current_ma`` is
         taken as is; the ``t_end_ns`` stamps become ``*_t_ns``.
@@ -122,7 +122,7 @@ class RakudaArmObs:
         )
 
     def stamped(self, *, t0_ns: int, frame_t_ns: int) -> "RakudaArmObs":
-        """A copy with the three ``*_time_s`` fields set relative to ``t0_ns`` (spec D37).
+        """A copy with the three ``*_time_s`` fields set relative to ``t0_ns``.
 
         ``self`` is left untouched.  A read stamp that is None keeps its
         ``*_time_s`` None (the leader of ``record_with_fixed_leader``).
@@ -213,7 +213,7 @@ RAKUDA_MOTOR_MAPPING: Dict[str, str] = {
 # Canonical Rakuda joint names (used for validation and config templates).
 RAKUDA_JOINT_NAMES: Tuple[str, ...] = tuple(RAKUDA_MOTOR_MAPPING.keys())
 
-#: Port value meaning "find the bus by scanning" (spec D17).
+#: Port value meaning "find the bus by scanning".
 PORT_AUTO = "auto"
 
 RAKUDA_GRIPPER_JOINT_NAMES: Tuple[str, ...] = ("l_arm_grip", "r_arm_grip")
@@ -232,7 +232,7 @@ RAKUDA_CURRENT_CAPABLE_JOINTS: Tuple[str, ...] = tuple(
 )
 
 
-#: GOAL_POSITION sent to the leader grippers while they hold (spec §7.4 rule 4).
+#: GOAL_POSITION sent to the leader grippers while they hold.
 LEADER_GRIP_HOLD_POSITION: int = 2400
 
 
@@ -265,7 +265,7 @@ def _require_int(field_name: str, value: object) -> int:
 
 @dataclass(frozen=True)
 class BusHealthThresholds:
-    """Temperature / input-voltage limits for one bus (spec §4.3, §6.4).
+    """Temperature / input-voltage limits for one bus.
 
     ``warn_temperature_c`` logs a warning, ``max_temperature_c`` is a fault; the
     voltage window is a fault on either side.
@@ -291,12 +291,13 @@ class BusHealthThresholds:
             )
 
 
-#: Leader (XC330-T288, 12 V): idle motors read 40-55 °C, so warn above that and fault
-#: just under the motors' own TEMPERATURE_LIMIT of 70 (spec §15.6).
+#: Leader (XC330-T288, 12 V): idle motors self-heat to 40-60 °C, so warn above that
+#: and hold at 66, a few degrees under the motors' own TEMPERATURE_LIMIT of 70 at
+#: which they cut torque by themselves.
 LEADER_HEALTH_DEFAULT = BusHealthThresholds(
-    warn_temperature_c=62.0, max_temperature_c=68.0, min_voltage_v=9.0, max_voltage_v=13.5
+    warn_temperature_c=62.0, max_temperature_c=66.0, min_voltage_v=9.0, max_voltage_v=13.5
 )
-#: Follower (XM540 / XM430, 12 V). Not used by Stage 1.
+#: Follower (XM540 / XM430, 12 V). Configurable; the bilateral loop does not check it.
 FOLLOWER_HEALTH_DEFAULT = BusHealthThresholds(
     warn_temperature_c=60.0, max_temperature_c=70.0, min_voltage_v=10.0, max_voltage_v=15.0
 )
@@ -312,23 +313,22 @@ _BILATERAL_GAIN_FIELDS: Tuple[str, ...] = (
 
 @dataclass(frozen=True)
 class RakudaBilateralParams:
-    """Parameters of the leader current-control loop (spec §4.3).
+    """Parameters of the leader current-control loop.
 
     Units: positions in encoder counts, velocities in velocity counts
-    (0.229 rpm/LSB), currents in mA, times in seconds. Values marked
-    "bench" in the spec are placeholders until measured on the hardware.
+    (0.229 rpm/LSB), currents in mA, times in seconds.
     Every rule in ``__post_init__`` raises ``ValueError``.
     """
 
     #: Joints driven in current mode; subset of ``RAKUDA_CURRENT_CAPABLE_JOINTS``.
-    #: ``torso_yaw`` is opt-in (spec D22).
+    #: ``torso_yaw`` is opt-in.
     current_joints: Tuple[str, ...] = RAKUDA_ARM_JOINT_NAMES
-    #: Loop rate, divider and read timeouts are the measured values of spec §15.7
-    #: (RETURN_DELAY_TIME=0: read_state_block(17) p99 ~5.1 ms, D33 -> 8 ms).
+    #: Loop rate, divider and read timeouts are bench-measured defaults (RETURN_DELAY_TIME=0:
+    #: read_state_block(17) p99 ~5.1 ms; read timeout = max(1.5 * p99, p99 + 3 ms) -> 8 ms).
     control_hz: float = 50.0
-    #: Follower I/O runs every ``follower_divider``-th cycle (spec D41).
+    #: Follower I/O runs every ``follower_divider``-th cycle.
     follower_divider: int = 1
-    #: Hard upper bound of one leader read attempt (spec D32).
+    #: Hard upper bound of one leader read attempt.
     read_timeout_s: float = 0.008
     follower_read_timeout_s: float = 0.008
     follower_lost_cycles: int = 3
@@ -371,7 +371,7 @@ class RakudaBilateralParams:
     hold_profile_velocity: int = 40
     leader_health: BusHealthThresholds = LEADER_HEALTH_DEFAULT
     follower_health: BusHealthThresholds = FOLLOWER_HEALTH_DEFAULT
-    #: Relative to the current working directory (spec §5.7).
+    #: Relative to the current working directory.
     gravity_model_path: str = ".robopy/rakuda/leader_gravity.json"
 
     def __post_init__(self) -> None:
@@ -486,10 +486,10 @@ class RakudaBilateralParams:
 
 @dataclass(frozen=True)
 class RakudaArmState:
-    """One synchronous read of every motor on a bus (spec §3.2).
+    """One synchronous read of every motor on a bus.
 
     The arrays are in ``names`` order. ``current_ma`` keeps the motor's raw
-    sign (spec D36). ``t_start_ns`` / ``t_end_ns`` bracket the bus transaction
+    sign. ``t_start_ns`` / ``t_end_ns`` bracket the bus transaction
     on ``time.monotonic_ns``; ``seq`` increases by one per read.
     """
 
@@ -512,7 +512,7 @@ class RakudaArmState:
 
 @dataclass(frozen=True)
 class RakudaTorquePolicy:
-    """Which joints each arm torque-enables at connect time (spec §7.4, D35).
+    """Which joints each arm torque-enables at connect time.
 
     Attributes:
         leader: Leader joints held in position mode by ``RakudaLeader.connect()``;
@@ -531,7 +531,7 @@ class RakudaTorquePolicy:
 def resolve_torque_policy(cfg: RakudaConfig) -> RakudaTorquePolicy:
     """Resolves the torque defaults of ``cfg`` and checks them against bilateral mode.
 
-    Rules (spec §7.4):
+    Rules:
 
     1. ``leader = (cfg.leader_torque_enabled or ()) ∪ grippers`` (grippers always).
     2. ``follower`` = all joints when ``cfg.follower_torque_enabled`` is None,
