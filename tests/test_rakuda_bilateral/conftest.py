@@ -415,7 +415,7 @@ def bus(sdk: FakeSdk) -> DynamixelBus:
     return make_bus()
 
 
-# --- Simulated Rakuda buses (spec §10.1) ---------------------------------------
+# --- Simulated Rakuda buses ---------------------------------------------------
 #
 # The 17 motor names / IDs / models come straight from the arm classes, so a
 # change there is reflected here without a second table.
@@ -477,7 +477,7 @@ def make_follower_bus(
     )
 
 
-# --- Leader loop helpers (spec §10.2 test_leader_loop.py) ----------------------
+# --- Leader loop helpers -------------------------------------------------------
 #
 # The loop is tested against a stub law so these tests do not depend on
 # ``BilateralLaw``; only the ``LawOutput`` container is shared.
@@ -584,7 +584,7 @@ def make_loop(
     """A ``LeaderCurrentLoop`` on a simulated leader (and optionally follower) bus.
 
     ``RETURN_DELAY_TIME`` is 0 on every motor, as on the real arms after
-    spec §15.7, so a default preflight has no warnings.
+    ``set-return-delay``, so a default preflight has no warnings.
     """
     clock = SimClock()
     params = RakudaBilateralParams(current_joints=tuple(joints)) if params is None else params
