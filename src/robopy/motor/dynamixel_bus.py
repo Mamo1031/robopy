@@ -41,7 +41,7 @@ NUM_WRITE_RETRY = 2  # 10から2に削減 (パフォーマンス向上のため)
 #: write (``write_with_readback``) and of the per-motor model-number reads.
 READBACK_TIMEOUT_S = 0.040
 #: pyserial write timeout applied by ``open()``.  A write that cannot complete
-#: within this time raises instead of stalling the control thread (spec D32).
+#: within this time raises instead of stalling the control thread.
 SERIAL_WRITE_TIMEOUT_S = 0.02
 
 #: SDK results that mean "the motors did not answer in time"; they are retried
@@ -457,7 +457,7 @@ class DynamixelBus:
     # control loop never calls them because a ten-retry read (about 37 ms
     # per attempt) blows any cycle budget.  Here one attempt is ``txPacket
     # -> setPacketTimeoutMillis -> rxPacket``, so the SDK's busy-poll can
-    # never run longer than the caller's ``timeout_s`` (spec D32).
+    # never run longer than the caller's ``timeout_s``.
     # ------------------------------------------------------------------
 
     def _select_motors(self, motor_names: Sequence[str]) -> List[DynamixelMotor]:
@@ -499,7 +499,7 @@ class DynamixelBus:
         ``SerialTimeoutException`` escapes between the two, and a stuck flag
         would make every later transmit on this handler (including the hold
         sequence that must follow a fault) return ``COMM_PORT_BUSY``.  The bus
-        is single-threaded (spec D41), so a set flag at entry is always stale
+        is single-threaded, so a set flag at entry is always stale
         and is cleared as well.
 
         Args:
