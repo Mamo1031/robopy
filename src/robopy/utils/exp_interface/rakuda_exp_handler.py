@@ -14,6 +14,7 @@ from robopy.config import RakudaConfig, RakudaObs
 from robopy.config.robot_config.rakuda_config import RakudaSensorParams
 from robopy.config.sensor_config.params_config import CameraParams
 from robopy.robots import RakudaRobot
+from robopy.robots.rakuda.rakuda_leader_control import LoopState
 from robopy.utils.worker.rakuda_save_worker import RakudaSaveWorker
 
 from .exp_handler import ExpHandler
@@ -85,6 +86,10 @@ class RakudaExpHandler(ExpHandler[RakudaObs, RakudaRobot, RakudaConfig, RakudaSa
     def record(self, max_frames: int, if_async: bool = True) -> RakudaObs:
         """record data from Rakuda robot
 
+        A recording the bilateral loop ended with a fault returns the frames
+        collected so far, or raises when there are none; either way the operator
+        is told to save before restarting.
+
         Args:
             max_frames (int): maximum number of frames to record
             if_async (bool, optional): If use parallel. Defaults to True.
@@ -98,13 +103,36 @@ class RakudaExpHandler(ExpHandler[RakudaObs, RakudaRobot, RakudaConfig, RakudaSa
         try:
             obs = self.robot.record_parallel(max_frame=max_frames, fps=self.fps)
         except Exception as e:
+            self._print_loop_fault()
             raise RuntimeError(f"Failed to record from Rakuda robot: {e}")
         except KeyboardInterrupt:
+            # Unreachable: record_parallel() turns Ctrl-C into a partial
+            # recording; kept for a robot system that re-raises it.
             logger.info("Recording stopped by user...")
             sleep(0.5)
             self.close()
             raise RuntimeError("Recording stopped by user")
+        self._print_loop_fault()
         return obs
+
+    def _print_loop_fault(self) -> None:
+        """Tells the operator to save before restarting when the bilateral loop faulted.
+
+        A fault is latched with both arms held; recording again needs
+        ``stop_bilateral()`` -> fix -> ``start_bilateral()``, so the frames
+        collected so far should be saved first.
+        """
+        control = self.robot.control_report()
+        if control.get("state") != LoopState.FAULT.value:
+            return
+        # The loop latches the first fault as the cause; later entries are
+        # consequences of the stop (hold_failed, stop_timeout, ...).
+        faults = control.get("faults") or []
+        cause = faults[0] if faults else {}
+        reason = cause.get("reason", "unknown")
+        detail = cause.get("detail")
+        where = f" ({detail})" if detail else ""
+        print(f"fault: {reason}{where} — save first, then restart")
 
     def send(self, max_frame: int, fps: int, leader_action: NDArray[float32]) -> None:
         """send leader action to Rakuda robot"""
@@ -166,7 +194,7 @@ class RakudaExpHandler(ExpHandler[RakudaObs, RakudaRobot, RakudaConfig, RakudaSa
         return self._robot.config
 
     def _init_config(self, rakuda_config: RakudaConfig) -> RakudaConfig:
-        """Fills in the default camera without dropping any other field (spec D34).
+        """Fills in the default camera without dropping any other field.
 
         ``rakuda_config`` is never mutated: it is returned as is when it already
         names its cameras, otherwise a ``dataclasses.replace`` copy carrying the
@@ -190,7 +218,7 @@ class RakudaExpHandler(ExpHandler[RakudaObs, RakudaRobot, RakudaConfig, RakudaSa
         return replace(rakuda_config, sensors=sensors)
 
     def save_metadata(self, save_path: str, data_shape: Dict[str, Any] | None = None) -> None:
-        """Writes ``metadata.json`` with the base fields plus ``control`` (spec §8.4).
+        """Writes ``metadata.json`` with the base fields plus ``control``.
 
         ``control`` is ``RakudaRobot.control_report()``; ``control.config_mismatch``
         is set when the reported mode disagrees with ``config.bilateral``.
