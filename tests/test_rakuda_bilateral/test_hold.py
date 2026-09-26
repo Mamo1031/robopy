@@ -1,4 +1,4 @@
-"""``hold_joints`` and the control-module vocabulary (spec §3.2, §6.3, §10.2 ``_hold``)."""
+"""``hold_joints`` and the control-module vocabulary."""
 
 from __future__ import annotations
 
@@ -89,7 +89,7 @@ def assert_off(bus: SimulatedDynamixelBus, names: Sequence[str]) -> None:
         assert bus.registers(name).torque_enable == 0, name
     for values in writes(bus, XControlTable.TORQUE_ENABLE):
         for name in names:
-            assert values.get(name, 0) == 0, f"TORQUE_ENABLE=1 written to {name}"  # H1
+            assert values.get(name, 0) == 0, f"TORQUE_ENABLE=1 written to {name}"
 
 
 @pytest.fixture
@@ -228,9 +228,9 @@ class TestHoldSequence:
             "TORQUE_ENABLE",  # 1. off
             "OPERATING_MODE",  # 2. mode 3
             "PROFILE_VELOCITY",  # 3.
-            "GOAL_POSITION",  # 5. before torque on (H1)
+            "GOAL_POSITION",  # 5. before torque on
             "TORQUE_ENABLE",  # 6. on
-            "GOAL_POSITION",  # 7. after torque on (H3)
+            "GOAL_POSITION",  # 7. after torque on
         ]
         goal = {name: 2048 for name in J}
         assert bus.instruction_log[0] == ("TORQUE_ENABLE", {name: 0 for name in J})
@@ -486,8 +486,8 @@ class TestFallbacks:
     def test_stale_snapshot_does_not_veto_a_fresh_reading(
         self, bus: SimulatedDynamixelBus, clock: SimClock, caplog: pytest.LogCaptureFixture
     ) -> None:
-        # A snapshot older than max_snapshot_age_s is no reference (spec 6.3.1 sizes
-        # the jump bound for that age): the fresh reading is held, not vetoed.
+        # A snapshot older than max_snapshot_age_s is no reference (the jump bound
+        # only holds for a fresh one): the fresh reading is held, not vetoed.
         bus.registers(J[0]).set(XControlTable.PRESENT_POSITION, 2348)  # 300 counts off
         state = snapshot(J, [2048, 2048, 2048], t_end_ns=clock.monotonic_ns() - 500_000_000)
 
@@ -728,7 +728,7 @@ class TestHoldFailed:
 
         assert isinstance(info.value.__cause__, RuntimeError)
         assert isinstance(info.value, BilateralError)
-        assert_off(bus, J)  # nothing torque-enabled without its goal (H1)
+        assert_off(bus, J)  # nothing torque-enabled without its goal
         for name in J:
             assert bus.registers(name).operating_mode == OperatingMode.POSITION
 
