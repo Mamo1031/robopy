@@ -129,7 +129,9 @@ nav:
     - Install: getting-started/installation.md
     - Quickstart: getting-started/quickstart.md
   - Robot:
-    - Rakuda: robots/rakuda.md
+    - Rakuda:
+      - robots/rakuda.md
+      - Bilateral bring-up: robots/rakuda_bilateral_bringup.md
     - Koch: robots/koch.md
     - xArm: robots/xarm.md
     - SO-101: robots/so101.md
