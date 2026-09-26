@@ -17,8 +17,10 @@ def test_dotrobopy_creates_default_yaml(tmp_path: Path, monkeypatch: pytest.Monk
 
     yaml_path = get_rakuda_yaml_path()
     assert yaml_path.exists()
+    # The generated template leaves both lists null: the defaults are
+    # resolved later by resolve_torque_policy(), not by the YAML layer.
     assert out.leader_torque_enabled is None
-    assert out.follower_torque_enabled == list(RAKUDA_JOINT_NAMES)
+    assert out.follower_torque_enabled is None
 
 
 def test_dotrobopy_supports_all_keyword(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
