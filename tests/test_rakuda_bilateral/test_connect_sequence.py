@@ -1,4 +1,4 @@
-"""``connect()``/``disconnect()`` of the Rakuda arms on simulated buses (spec D13/D14/D15/D25/D35).
+"""``connect()``/``disconnect()`` of the Rakuda arms on simulated buses.
 
 Every test builds a ``RakudaLeader``/``RakudaFollower`` over a
 ``SimulatedDynamixelBus`` injected through ``bus_factory``; the bus's
@@ -211,7 +211,7 @@ class TestConventionalConnect:
         assert not arm.is_connected
 
 
-# --- D13: model check before anything is written -------------------------------------
+# --- model check before anything is written ------------------------------------------
 
 
 class TestVerifyModels:
@@ -229,7 +229,7 @@ class TestVerifyModels:
         assert not bus_l.port_handler.is_open
 
 
-# --- D25: operating-mode recovery ---------------------------------------------------
+# --- operating-mode recovery --------------------------------------------------------
 
 
 class TestModeRecovery:
@@ -271,7 +271,7 @@ class TestModeRecovery:
         regs = bus_f.registers(JOINT)
         assert (regs.operating_mode, regs.torque_enable, regs.goal_position) == (3, 1, 900)
         seq = items_for(bus_f, JOINT)
-        assert seq.index(("GOAL_POSITION", 900)) < seq.index(("TORQUE_ENABLE", 1))  # H1
+        assert seq.index(("GOAL_POSITION", 900)) < seq.index(("TORQUE_ENABLE", 1))
 
     @pytest.mark.parametrize("mode", [OperatingMode.CURRENT, OperatingMode.VELOCITY])
     def test_state_d_is_held_then_conventional_connect_refuses(
@@ -356,7 +356,7 @@ class TestModeRecovery:
     ) -> None:
         # State D on the follower (every joint wanted): the mode change to 3 is
         # confirmed but no position can be read, so the hold leaves the joint
-        # torque-off with no GOAL_POSITION written after the mode change (D27 H1).
+        # torque-off with no GOAL_POSITION written after the mode change.
         # It reads mode 3 / torque 0 again afterwards, but the policy must not
         # switch it on: the connect is refused instead.
         enter_current_mode(bus_f, [JOINT], goal_current=50)
@@ -384,7 +384,7 @@ class TestModeRecovery:
         assert not bus_f.port_handler.is_open
 
 
-# --- D14: gripper EEPROM only where it differs -----------------------------------------
+# --- gripper EEPROM only where it differs ----------------------------------------------
 
 
 class TestGripperEeprom:
@@ -477,9 +477,12 @@ class TestGripperEeprom:
         monkeypatch.setattr(bus_l, "write_with_readback", unconfirmed)
         arm = leader(bus_l)
 
-        with pytest.raises(ConnectionError, match=rf"r_arm_grip.*OPERATING_MODE.*{int(mode)}"):
+        with pytest.raises(
+            ConnectionError, match=rf"r_arm_grip.*OPERATING_MODE.*{int(mode)}"
+        ) as info:
             arm.connect()
 
+        assert "`robopy-rakuda-ports show --port sim --side leader`" in str(info.value)
         assert not arm.is_connected
         assert bus_l.registers("r_arm_grip").operating_mode == mode
         assert bus_l.registers("r_arm_grip").torque_enable == 0
@@ -494,7 +497,7 @@ class TestGripperEeprom:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         # Mode 3 is not the wanted 5, but torque-on in it only holds a position:
-        # the unconfirmed write stays a warning (D14).
+        # the unconfirmed write stays a warning.
         bus_l.registers("r_arm_grip").set(XControlTable.OPERATING_MODE, int(OperatingMode.POSITION))
 
         def unconfirmed(*args: Any, **kwargs: Any) -> None:
@@ -517,7 +520,7 @@ class TestGripperEeprom:
         assert bus_l.instruction_log == []
 
 
-# --- D15/D35: torque policy at connect --------------------------------------------------
+# --- torque policy at connect -----------------------------------------------------------
 
 
 class TestTorquePolicy:
