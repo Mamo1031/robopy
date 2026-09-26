@@ -1,4 +1,4 @@
-"""Deadline-bounded bus transactions and the extended control table (spec §10.2)."""
+"""Deadline-bounded bus transactions and the extended control table."""
 
 from __future__ import annotations
 
