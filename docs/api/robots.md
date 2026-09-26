@@ -13,6 +13,8 @@
         - teleoperation
         - record
         - record_parallel
+        - record_with_fixed_leader
+        - control_report
 
 ::: robopy.config.robot_config.rakuda_config.RakudaConfig
 
@@ -23,8 +25,19 @@
         - __init__
         - connect
         - disconnect
-        - teleoperation
+        - teleoperate
+        - teleoperate_step
         - get_observation
+        - get_leader_state
+        - get_follower_state
+        - start_bilateral
+        - stop_bilateral
+        - ensure_bilateral_running
+        - ramp_follower_to
+        - release
+        - bilateral_active
+        - control_report
+        - torque_policy
 
 
 ::: robopy.robots.rakuda.rakuda_leader.RakudaLeader
@@ -47,6 +60,47 @@
         - disconnect
         - set_action
         - get_observation
+
+## :material-sync: Rakuda バイラテラル制御
+
+リーダーの電流制御ループ（重力補償 + 力覚フィードバック）。通常は `RakudaPairSys.start_bilateral()` / `RakudaRobot.record*()` から使い、ここのクラスを直接組み立てる必要はありません。
+
+### BilateralSetup
+
+::: robopy.robots.rakuda.rakuda_pair_sys.BilateralSetup
+    options:
+      show_root_heading: true
+      show_source: false
+
+### LeaderCurrentLoop
+
+::: robopy.robots.rakuda.rakuda_leader_control.LeaderCurrentLoop
+    options:
+      show_root_heading: true
+      show_source: false
+
+### BilateralLaw
+
+::: robopy.robots.rakuda.rakuda_control_laws.BilateralLaw
+    options:
+      show_root_heading: true
+      show_source: false
+
+### hold_joints
+
+::: robopy.robots.rakuda.rakuda_leader_control.hold_joints
+    options:
+      show_root_heading: true
+      show_source: false
+
+### LeaderGravityModel
+
+::: robopy.robots.rakuda.rakuda_gravity.LeaderGravityModel
+    options:
+      show_root_heading: true
+      show_source: false
+
+## :material-robot: KochRobot
 
 ::: robopy.robots.koch.koch_robot.KochRobot
     options:
