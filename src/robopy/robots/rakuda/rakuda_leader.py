@@ -50,7 +50,7 @@ class RakudaLeader(RakudaArm):
         }
 
     def _apply_torque_policy(self, state: ConnectState) -> None:
-        """Leader torque policy (spec D15/D35).
+        """Leader torque policy.
 
         Conventional mode: a motor that is on but not wanted is a previous
         session's hold and connecting is refused (``ConnectionError``), so the
