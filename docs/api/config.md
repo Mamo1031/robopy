@@ -25,6 +25,38 @@
       show_root_heading: true
       show_source: false
 
+## :material-sync: Rakuda バイラテラル設定
+
+`RakudaConfig(bilateral=RakudaBilateralParams(...))` を渡したときだけリーダーの電流制御ループが有効になります。`bilateral=None`（既定）は従来の位置テレオペレーションです。
+
+### RakudaBilateralParams
+
+::: robopy.config.robot_config.rakuda_config.RakudaBilateralParams
+    options:
+      show_root_heading: true
+      show_source: false
+
+### BusHealthThresholds
+
+::: robopy.config.robot_config.rakuda_config.BusHealthThresholds
+    options:
+      show_root_heading: true
+      show_source: false
+
+### RakudaTorquePolicy
+
+::: robopy.config.robot_config.rakuda_config.RakudaTorquePolicy
+    options:
+      show_root_heading: true
+      show_source: false
+
+### resolve_torque_policy
+
+::: robopy.config.robot_config.rakuda_config.resolve_torque_policy
+    options:
+      show_root_heading: true
+      show_source: false
+
 ## :material-camera-outline: センサー設定
 
 ### CameraParams
@@ -62,6 +94,20 @@
 ### RakudaObs
 
 ::: robopy.config.robot_config.rakuda_config.RakudaObs
+    options:
+      show_root_heading: true
+      show_source: false
+
+### RakudaArmObs
+
+::: robopy.config.robot_config.rakuda_config.RakudaArmObs
+    options:
+      show_root_heading: true
+      show_source: false
+
+### RakudaArmState
+
+::: robopy.config.robot_config.rakuda_config.RakudaArmState
     options:
       show_root_heading: true
       show_source: false
@@ -210,6 +256,14 @@ Rakudaを使用すると、実行ディレクトリ直下に `.robopy/rakuda/con
 `[]`（空リスト）を指定すると、全関節トルクOFFになります。
 
 `all` を指定すると、全関節トルクONになります。
+
+その他のキー（`null` のときはコードで渡した値のまま）:
+
+- `leader.port` / `follower.port`: デバイスパス、または `auto`（バスをスキャンして判定）
+- `safety.hold_on_disconnect`: 切断時に両腕をトルクONのまま現在位置で保持するか（`null` ならバイラテラル時 `true`、従来モード時 `false`）
+- `bilateral:` 以下: `RakudaBilateralParams` のフィールド名で上書き（`leader_health` / `follower_health` は入れ子）。コードで `RakudaConfig(bilateral=...)` を渡していないときは無視されます（INFO ログ）。YAML だけでバイラテラルを有効にするキーはありません
+
+既知のセクション内の未知キーは `ValueError` になります。
 
 詳細と例は [docs/robots/rakuda.md](../robots/rakuda.md) を参照してください。
 
