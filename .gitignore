@@ -28,3 +28,4 @@ data/
 # Local planning files and per-repo Claude instructions
 CLAUDE.md
 tasks/
+.claude/
