@@ -1,4 +1,4 @@
-"""``RakudaExpHandler._init_config`` keeps every field of the config (spec D34, T20)."""
+"""``RakudaExpHandler._init_config`` keeps every field of the config."""
 
 from __future__ import annotations
 
