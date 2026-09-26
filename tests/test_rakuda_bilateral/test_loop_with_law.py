@@ -1,4 +1,4 @@
-"""``LeaderCurrentLoop`` driving the real laws on simulated buses (Stage 1b integration).
+"""``LeaderCurrentLoop`` driving the real laws on simulated buses.
 
 ``test_leader_loop.py`` runs the loop against a stub law and
 ``test_control_laws.py`` runs the laws on hand-built snapshots; here
@@ -265,7 +265,7 @@ class TestGravity:
         assert_held_in_place(h, J3)
 
     def test_re_engage_keeps_the_barrier_current_continuous(self) -> None:
-        # §3.2: re_engage() is t_engaged=0, gate=0 only.  A joint resting on its
+        # re_engage() is t_engaged=0, gate=0 only.  A joint resting on its
         # limit barrier must not have the barrier current cut back to the gravity
         # term (a reset would restart the rate limiter from 0 mA here).
         params = make_params(allow_uncompensated=True, current_rate_ma_per_s=500.0)
@@ -374,7 +374,7 @@ class TestSignCheck:
         h = make_law_loop(lambda bus: law, params=params, joints=(HEAVY,))
         h.loop.configure()
         # configure() writes 0 mA (no gravity term); the pulse starts in the loop,
-        # where the overshoot abort is checked every cycle (spec §5.3):
+        # where the overshoot abort is checked every cycle:
         # 3000 mA/s * 20 ms reaches the 40 mA level on the first cycle.
         assert h.goal_currents() == [{HEAVY: 0}]
         h.run(1)
